@@ -16,6 +16,11 @@
 #include <math.h>
 #include <string.h>
 
+#if defined(PDU_API_DEBUG_ONLY)
+#define PDU_API_DEBUG_SOURCE 1
+#include "console.h"
+#endif
+
 namespace pdu {
 namespace control_api {
 
@@ -203,6 +208,139 @@ volatile uint8_t s_read_register   = static_cast<uint8_t>(Register::kInfo);
 uint8_t          s_sequence        = 0U;
 bool             s_initialised     = false;
 
+void printHex2(uint8_t value) {
+  if (value < 0x10U) {
+    Serial.print('0');
+  }
+  Serial.print(value, HEX);
+}
+
+#if defined(PDU_API_DEBUG_ONLY)
+enum class ApiDebugKind : uint8_t {
+  kRxSelect = 0U,
+  kRxCommand = 1U,
+  kRxBridge = 2U,
+  kTx = 3U,
+  kOverflow = 4U,
+};
+
+struct ApiDebugEvent {
+  ApiDebugKind kind;
+  uint8_t reg;
+  uint8_t count;
+  uint8_t arg0;
+  uint8_t arg1;
+  uint8_t arg2;
+};
+
+constexpr uint8_t kApiDebugQueueLen = 32U;
+volatile uint8_t s_api_debug_head = 0U;
+volatile uint8_t s_api_debug_tail = 0U;
+volatile uint16_t s_api_debug_dropped = 0U;
+ApiDebugEvent s_api_debug_queue[kApiDebugQueueLen] = {};
+
+void queueApiDebug(ApiDebugKind kind,
+                   uint8_t reg,
+                   uint8_t count,
+                   uint8_t arg0,
+                   uint8_t arg1,
+                   uint8_t arg2) {
+  const uint8_t next =
+      static_cast<uint8_t>((s_api_debug_head + 1U) % kApiDebugQueueLen);
+  if (next == s_api_debug_tail) {
+    ++s_api_debug_dropped;
+    return;
+  }
+  s_api_debug_queue[s_api_debug_head] = {kind, reg, count, arg0, arg1, arg2};
+  s_api_debug_head = next;
+}
+
+uint8_t responseLengthForRegister(uint8_t reg) {
+  if (reg == static_cast<uint8_t>(Register::kInfo)) {
+    return static_cast<uint8_t>(sizeof(ApiInfo));
+  }
+  if (reg == static_cast<uint8_t>(Register::kCommandStatus)) {
+    return static_cast<uint8_t>(sizeof(ApiCommandResult));
+  }
+  if (reg == static_cast<uint8_t>(Register::kPmbusResult)) {
+    return static_cast<uint8_t>(sizeof(ApiPmbusBridgeResult));
+  }
+  if (reg == static_cast<uint8_t>(Register::kTelemetryAll)) {
+    return 0xFFU;  /* larger than a byte; print as "all telemetry". */
+  }
+  return 1U;
+}
+
+void flushApiDebug() {
+  for (;;) {
+    uint16_t dropped = 0U;
+    ApiDebugEvent ev = {};
+    bool have_event = false;
+
+    noInterrupts();
+    if (s_api_debug_dropped != 0U) {
+      dropped = s_api_debug_dropped;
+      s_api_debug_dropped = 0U;
+    } else if (s_api_debug_tail != s_api_debug_head) {
+      ev = s_api_debug_queue[s_api_debug_tail];
+      s_api_debug_tail =
+          static_cast<uint8_t>((s_api_debug_tail + 1U) % kApiDebugQueueLen);
+      have_event = true;
+    }
+    interrupts();
+
+    if (dropped != 0U) {
+      Serial.print(F("[API DROP] events="));
+      Serial.println(dropped);
+      continue;
+    }
+    if (!have_event) {
+      break;
+    }
+
+    if (ev.kind == ApiDebugKind::kRxSelect) {
+      Serial.print(F("[API RX] select reg=0x"));
+      printHex2(ev.reg);
+      Serial.print(F(" bytes="));
+      Serial.println(ev.count);
+    } else if (ev.kind == ApiDebugKind::kRxCommand) {
+      Serial.print(F("[API RX] command reg=0x"));
+      printHex2(ev.reg);
+      Serial.print(F(" len="));
+      Serial.print(ev.count);
+      Serial.print(F(" cmd=0x"));
+      printHex2(ev.arg0);
+      Serial.print(F(" arg0=0x"));
+      printHex2(ev.arg1);
+      Serial.print(F(" arg1=0x"));
+      printHex2(ev.arg2);
+      Serial.println();
+    } else if (ev.kind == ApiDebugKind::kRxBridge) {
+      Serial.print(F("[API RX] pmbus reg=0x"));
+      printHex2(ev.reg);
+      Serial.print(F(" len="));
+      Serial.print(ev.count);
+      Serial.print(F(" rail="));
+      Serial.print(ev.arg0);
+      Serial.print(F(" op="));
+      Serial.print(ev.arg1);
+      Serial.print(F(" cmd=0x"));
+      printHex2(ev.arg2);
+      Serial.println();
+    } else if (ev.kind == ApiDebugKind::kTx) {
+      Serial.print(F("[API TX] reg=0x"));
+      printHex2(ev.reg);
+      if (ev.arg0 == 0xFFU) {
+        Serial.println(F(" len=telemetry_all"));
+      } else {
+        Serial.print(F(" len="));
+        Serial.println(ev.arg0);
+      }
+    }
+  }
+}
+#endif
+
 int32_t scale1000(double value) {
   if (isnan(value) || value > 2147483.0 || value < -2147483.0) {
     return 0;
@@ -340,6 +478,20 @@ void publishSnapshot(rail::Controller& r48,
                      SupervisorMode mode,
                      const bit::Report& pbit,
                      const bit::Report& cbit) {
+  /* Rate-limit to 20 Hz.  publishSnapshot's critical section disables IRQs
+   * for the duration of a 944-byte struct copy (~50 us at 72 MHz).  In a
+   * tight loop (notably the API_DEBUG_ONLY image, which has nothing else
+   * to do) that fires thousands of times per second and starves the I2C2
+   * slave ISR enough to corrupt CR1.ACK / Listen state - the master then
+   * sees every address byte NACKed.  20 Hz is plenty for telemetry and
+   * leaves >99.9% of wall-time available for the I2C ISR.                 */
+  static uint32_t s_last_publish_ms = 0U;
+  const uint32_t now = millis();
+  if ((now - s_last_publish_ms) < 50U) {
+    return;
+  }
+  s_last_publish_ms = now;
+
   ApiTelemetryAll next = {};
   next.magic[0] = 'T';
   next.magic[1] = 'L';
@@ -610,10 +762,17 @@ void onReceive(int count) {
     return;
   }
 
+#if defined(PDU_API_DEBUG_ONLY)
+  const uint8_t rx_count = static_cast<uint8_t>(count > 255 ? 255 : count);
+#endif
   const int reg = s_api_wire.read();
   s_read_register = static_cast<uint8_t>(reg);
   --count;
   if (count <= 0) {
+#if defined(PDU_API_DEBUG_ONLY)
+    queueApiDebug(ApiDebugKind::kRxSelect, static_cast<uint8_t>(reg),
+                  rx_count, 0U, 0U, 0U);
+#endif
     return;
   }
 
@@ -627,6 +786,10 @@ void onReceive(int count) {
     }
     s_pending_command = cmd;
     s_command_pending = true;
+#if defined(PDU_API_DEBUG_ONLY)
+    queueApiDebug(ApiDebugKind::kRxCommand, static_cast<uint8_t>(reg),
+                  static_cast<uint8_t>(i), cmd.command, cmd.arg0, cmd.arg1);
+#endif
   } else if (reg == static_cast<int>(Register::kPmbusBridge)) {
     ApiPmbusBridgeRequest req = {};
     uint8_t* dst = reinterpret_cast<uint8_t*>(&req);
@@ -640,15 +803,27 @@ void onReceive(int count) {
     }
     s_pending_bridge = req;
     s_bridge_pending = true;
+#if defined(PDU_API_DEBUG_ONLY)
+    queueApiDebug(ApiDebugKind::kRxBridge, static_cast<uint8_t>(reg),
+                  static_cast<uint8_t>(i), req.rail_id, req.op, req.command);
+#endif
   } else {
     while (s_api_wire.available()) {
       (void)s_api_wire.read();
     }
+#if defined(PDU_API_DEBUG_ONLY)
+    queueApiDebug(ApiDebugKind::kRxSelect, static_cast<uint8_t>(reg),
+                  rx_count, 0U, 0U, 0U);
+#endif
   }
 }
 
 void onRequest() {
   const uint8_t reg = s_read_register;
+#if defined(PDU_API_DEBUG_ONLY)
+  queueApiDebug(ApiDebugKind::kTx, reg, 0U, responseLengthForRegister(reg),
+                0U, 0U);
+#endif
   if (reg == static_cast<uint8_t>(Register::kInfo)) {
     s_api_wire.write(reinterpret_cast<const uint8_t*>(&s_info), sizeof(s_info));
   } else if (reg == static_cast<uint8_t>(Register::kTelemetryAll)) {
@@ -679,13 +854,85 @@ Status init() {
   s_snapshot.protocol_major = kProtocolMajor;
   s_snapshot.protocol_minor = kProtocolMinor;
 
+  /* Order matters here.
+   *
+   * stm32duino's TwoWire::begin(uint8_t address) hardcodes the I2C
+   * peripheral clock to 100 kHz inside i2c_init(). Calling setClock()
+   * BEFORE begin() therefore has no lasting effect: begin() overwrites
+   * it. To actually run the bus at kApiI2cClock_Hz we must:
+   *   1) bind the SCL/SDA pins,
+   *   2) call begin(addr) so HAL_I2C_Init configures the slave (this
+   *      also calls HAL_I2C_EnableListen_IT internally),
+   *   3) call setClock() to retune CCR/TRISE to the desired frequency,
+   *   4) re-arm slave listen mode, because i2c_setTiming() calls
+   *      HAL_I2C_Init() again which clears the I2C_IT_EVT|I2C_IT_ERR
+   *      enable bits and drops the slave back to STATE_READY (no
+   *      longer LISTEN). Without this the slave will silently NACK
+   *      every address byte from the master.                          */
   s_api_wire.setSCL(cfg::kPin_API_I2C2_SCL);
   s_api_wire.setSDA(cfg::kPin_API_I2C2_SDA);
   s_api_wire.begin(cfg::kApiI2cAddress);
+  s_api_wire.setClock(cfg::kApiI2cClock_Hz);
+  (void)HAL_I2C_EnableListen_IT(s_api_wire.getHandle());
   s_api_wire.onReceive(onReceive);
   s_api_wire.onRequest(onRequest);
   s_initialised = true;
+  Serial.print(F("[API INIT] I2C2 slave addr=0x"));
+  printHex2(cfg::kApiI2cAddress);
+  Serial.print(F(" clock="));
+  Serial.print(cfg::kApiI2cClock_Hz);
+  Serial.println(F("Hz pins SCL=PB10 SDA=PB11"));
   return Status::kOk;
+}
+
+/**
+ * @brief  Self-heal the I2C2 slave if a missed event left it deaf.
+ *
+ *  The bit-banged master on RoboGuard is timing-tolerant on its own pins,
+ *  but if a long IRQ-disabled window (long memcpy, long SWO drain, etc.)
+ *  causes the F1 I2C peripheral to miss its STOPF/AF window the slave can
+ *  end up with CR1.ACK cleared but obj->slaveMode still LISTEN at the
+ *  twi.c level - the user's HAL_I2C_EnableListen_IT() never gets re-fired
+ *  and every subsequent address byte NACKs forever.  Catch that case
+ *  every loop iteration and re-arm.  Cost is two register reads in the
+ *  hot path; correctness is worth it.
+ */
+static void rearmListenIfStuck() {
+  if (!s_initialised) {
+    return;
+  }
+  I2C_HandleTypeDef* const h = s_api_wire.getHandle();
+  if (h == nullptr || h->Instance == nullptr) {
+    return;
+  }
+
+  const uint32_t cr1 = h->Instance->CR1;
+  const bool pe_set      = (cr1 & I2C_CR1_PE)  != 0U;
+  const bool ack_set     = (cr1 & I2C_CR1_ACK) != 0U;
+  const bool state_listen = (h->State == HAL_I2C_STATE_LISTEN);
+
+  /* If we're properly armed, leave it alone. */
+  if (pe_set && ack_set && state_listen) {
+    return;
+  }
+
+  /* If a transfer is genuinely in progress (we just clocked into BUSY_TX_LISTEN
+   * via AddrCallback and the master is mid-byte), don't tear it down.       */
+  if (h->State == HAL_I2C_STATE_BUSY_TX_LISTEN ||
+      h->State == HAL_I2C_STATE_BUSY_RX_LISTEN ||
+      h->State == HAL_I2C_STATE_BUSY_TX ||
+      h->State == HAL_I2C_STATE_BUSY_RX) {
+    return;
+  }
+
+  /* Otherwise force the peripheral back to a known-good READY state and
+   * re-enable Listen mode + ACK + EVT/ERR interrupts.                       */
+  __HAL_I2C_DISABLE(h);
+  h->Instance->CR1 |= I2C_CR1_SWRST;
+  h->Instance->CR1 &= ~I2C_CR1_SWRST;
+  h->State = HAL_I2C_STATE_RESET;
+  (void)HAL_I2C_Init(h);
+  (void)HAL_I2C_EnableListen_IT(h);
 }
 
 void tick(rail::Controller& r48,
@@ -694,12 +941,22 @@ void tick(rail::Controller& r48,
           SupervisorMode mode,
           const bit::Report& pbit,
           const bit::Report& cbit) {
+#if defined(PDU_API_DEBUG_ONLY)
+  flushApiDebug();
+#endif
   if (!s_initialised) {
     return;
   }
 
+  rearmListenIfStuck();
+
   processCommand(r48, r24, r12);
   processBridge(r48, r24, r12);
+  /* publishSnapshot is internally rate-limited to 20 Hz, so the critical
+   * 944-byte memcpy under noInterrupts() runs at most every 50 ms.  In the
+   * API_DEBUG_ONLY image rails/winch/leds are never initialised, so the
+   * snapshot is mostly zeroes - that's fine, the master cannot read more
+   * than 32 bytes anyway via the slave's hardware buffer.                   */
   publishSnapshot(r48, r24, r12, mode, pbit, cbit);
 }
 

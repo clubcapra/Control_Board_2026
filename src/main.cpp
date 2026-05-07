@@ -776,6 +776,14 @@ void setup() {
    * connected.  Force it to plain GPIO input early and leave it untouched. */
   pinMode(cfg::kPin_PB14_Unused, INPUT);
 
+#if defined(PDU_API_DEBUG_ONLY)
+  /* API debug image: bring up only the RG I2C2 slave and SWO API logs.  This
+   * removes LM5066H1 scans/configuration from the path so a silent monitor
+   * means "no API traffic", not "boot is stuck before API init".             */
+  (void)control_api::init();
+  return;
+#endif
+
   /* (2) Output drivers are initialised after the fail-safe LOW boot pass.   */
   leds::init();
   leds::setPattern(leds::Pattern::kSolid);
@@ -855,6 +863,12 @@ void setup() {
 void loop() {
   const uint32_t loop_started_ms = millis();
   const uint32_t now = loop_started_ms;
+
+#if defined(PDU_API_DEBUG_ONLY)
+  control_api::tick(s_rail48, s_rail24, s_rail12, s_mode, s_pbit_report, s_cbit_report);
+  serviceWatchdogIfHealthy(loop_started_ms);
+  return;
+#endif
 
   /* Run housekeeping that must happen at every iteration.                   */
   estop::tick();
