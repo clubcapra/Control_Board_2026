@@ -233,6 +233,10 @@ constexpr uint32_t kPin_Winch_nFAULT    = kPin_NotConnected;
  *  hot-swap controllers.                                                     */
 constexpr uint32_t kPin_API_I2C2_SCL    = PB10;
 constexpr uint32_t kPin_API_I2C2_SDA    = PB11;
+/* Lowered from 100 kHz to 50 kHz: gives more rise-time margin on a bus
+ * that relies on STM32 internal pull-ups and a bit-banged master, so the
+ * slave can ACK reliably even if external pull-ups are weak/absent.   */
+constexpr uint32_t kApiI2cClock_Hz      = 50000UL;
 constexpr uint8_t  kApiI2cAddress       = 0x31U;
 
 /* ===========================================================================

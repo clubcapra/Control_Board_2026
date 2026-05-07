@@ -23,6 +23,25 @@
 
 #include <SerialSWO.h>
 #undef  Serial
+
+#if defined(PDU_API_DEBUG_ONLY) && !defined(PDU_API_DEBUG_SOURCE)
+class PduSilentConsole {
+ public:
+  void begin(unsigned long baud) { SerialSWO.begin(baud); }
+  void flush() { SerialSWO.flush(); }
+  explicit operator bool() const { return true; }
+
+  template <typename... Args>
+  void print(Args...) {}
+
+  template <typename... Args>
+  void println(Args...) {}
+};
+
+static PduSilentConsole PduSilentSerial;
+#define Serial PduSilentSerial
+#else
 #define Serial SerialSWO
+#endif
 
 #endif /* PDU_CONSOLE_H_ */
