@@ -16,10 +16,19 @@
 #include <math.h>
 #include <string.h>
 
-#if defined(PDU_API_DEBUG_ONLY)
+/* Route every Serial.print in this TU through the SWO console.
+ *
+ * Without this, "Serial" resolves to the framework's HardwareSerial USART1,
+ * which is never begin()-ed by the firmware (only the SWO alias is started
+ * in main.cpp).  The first Serial.print would then spin forever inside
+ * HardwareSerial::write() waiting for a TX-interrupt that never fires,
+ * blowing the IWDG and causing a boot loop.
+ *
+ * PDU_API_DEBUG_SOURCE keeps console.h on the real SerialSWO path even when
+ * PDU_API_DEBUG_ONLY is defined (other TUs use the silent console in that
+ * build to suppress non-API logs).                                          */
 #define PDU_API_DEBUG_SOURCE 1
 #include "console.h"
-#endif
 
 namespace pdu {
 namespace control_api {
