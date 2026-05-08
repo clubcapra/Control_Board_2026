@@ -217,6 +217,14 @@ volatile uint8_t s_read_register   = static_cast<uint8_t>(Register::kInfo);
 uint8_t          s_sequence        = 0U;
 bool             s_initialised     = false;
 
+// #region agent log
+/* Counters bumped from the I2C2 ISR callbacks; printed by the throttled
+ * dbgDumpI2c2State() so we can see whether the slave is still receiving
+ * any traffic at all when the master starts timing out.                   */
+volatile uint32_t s_dbg_rx_count = 0U;
+volatile uint32_t s_dbg_tx_count = 0U;
+// #endregion
+
 void printHex2(uint8_t value) {
   if (value < 0x10U) {
     Serial.print('0');
@@ -767,6 +775,11 @@ void processBridge(rail::Controller& r48,
 }
 
 void onReceive(int count) {
+  // #region agent log
+  /* ISR context - keep absolutely minimal; bump a counter that the
+   * foreground throttled dump prints out every 250 ms.                    */
+  ++s_dbg_rx_count;
+  // #endregion
   if (count <= 0) {
     return;
   }
@@ -828,6 +841,9 @@ void onReceive(int count) {
 }
 
 void onRequest() {
+  // #region agent log
+  ++s_dbg_tx_count;
+  // #endregion
   const uint8_t reg = s_read_register;
 #if defined(PDU_API_DEBUG_ONLY)
   queueApiDebug(ApiDebugKind::kTx, reg, 0U, responseLengthForRegister(reg),
@@ -894,6 +910,43 @@ Status init() {
   return Status::kOk;
 }
 
+// #region agent log
+/* Periodic dump of the live I2C2 state to SWO so we can correlate the
+ * "WAIT_TIMEOUT on RG side" failure with a specific stuck-bit on the
+ * slave side.  Throttled to once per 250 ms to avoid flooding SWO.        */
+static void dbgDumpI2c2State(const char* tag) {
+  I2C_HandleTypeDef* const h = s_api_wire.getHandle();
+  if (h == nullptr || h->Instance == nullptr) {
+    return;
+  }
+  const uint32_t cr1 = h->Instance->CR1;
+  const uint32_t sr1 = h->Instance->SR1;
+  const uint32_t sr2 = h->Instance->SR2;
+  const uint32_t st  = static_cast<uint32_t>(h->State);
+  Serial.print(F("[I2C2 DBG "));
+  Serial.print(tag);
+  Serial.print(F("] CR1=0x"));   Serial.print(cr1, HEX);
+  Serial.print(F(" SR1=0x"));    Serial.print(sr1, HEX);
+  Serial.print(F(" SR2=0x"));    Serial.print(sr2, HEX);
+  Serial.print(F(" hal=0x"));    Serial.print(st, HEX);
+  Serial.print(F(" PE="));       Serial.print((cr1 & I2C_CR1_PE)  ? 1 : 0);
+  Serial.print(F(" ACK="));      Serial.print((cr1 & I2C_CR1_ACK) ? 1 : 0);
+  Serial.print(F(" BUSY="));     Serial.print((sr2 & I2C_SR2_BUSY) ? 1 : 0);
+  Serial.print(F(" BERR="));     Serial.print((sr1 & I2C_SR1_BERR)  ? 1 : 0);
+  Serial.print(F(" ARLO="));     Serial.print((sr1 & I2C_SR1_ARLO)  ? 1 : 0);
+  Serial.print(F(" AF="));       Serial.print((sr1 & I2C_SR1_AF)    ? 1 : 0);
+  Serial.print(F(" OVR="));      Serial.print((sr1 & I2C_SR1_OVR)   ? 1 : 0);
+  Serial.print(F(" PECERR="));   Serial.print((sr1 & I2C_SR1_PECERR) ? 1 : 0);
+  uint32_t rx, tx;
+  noInterrupts();
+  rx = s_dbg_rx_count;
+  tx = s_dbg_tx_count;
+  interrupts();
+  Serial.print(F(" rx#="));      Serial.print(rx);
+  Serial.print(F(" tx#="));      Serial.println(tx);
+}
+// #endregion
+
 /**
  * @brief  Self-heal the I2C2 slave if a missed event left it deaf.
  *
@@ -920,6 +973,20 @@ static void rearmListenIfStuck() {
   const bool ack_set     = (cr1 & I2C_CR1_ACK) != 0U;
   const bool state_listen = (h->State == HAL_I2C_STATE_LISTEN);
 
+  // #region agent log
+  /* Throttled snapshot every 250 ms regardless of action - so we can see
+   * if the peripheral looks "fine" (PE=ACK=1, state=LISTEN) but is
+   * actually NACKing because of a stuck error/BUSY flag.                  */
+  {
+    static uint32_t s_dbg_last_ms = 0U;
+    const uint32_t now_ms = millis();
+    if ((now_ms - s_dbg_last_ms) >= 250U) {
+      s_dbg_last_ms = now_ms;
+      dbgDumpI2c2State("tick");
+    }
+  }
+  // #endregion
+
   /* If we're properly armed, leave it alone. */
   if (pe_set && ack_set && state_listen) {
     return;
@@ -934,6 +1001,11 @@ static void rearmListenIfStuck() {
     return;
   }
 
+  // #region agent log
+  Serial.println(F("[I2C2 RECOV] re-arming stuck slave"));
+  dbgDumpI2c2State("pre-reset");
+  // #endregion
+
   /* Otherwise force the peripheral back to a known-good READY state and
    * re-enable Listen mode + ACK + EVT/ERR interrupts.                       */
   __HAL_I2C_DISABLE(h);
@@ -942,6 +1014,10 @@ static void rearmListenIfStuck() {
   h->State = HAL_I2C_STATE_RESET;
   (void)HAL_I2C_Init(h);
   (void)HAL_I2C_EnableListen_IT(h);
+
+  // #region agent log
+  dbgDumpI2c2State("post-reset");
+  // #endregion
 }
 
 void tick(rail::Controller& r48,
