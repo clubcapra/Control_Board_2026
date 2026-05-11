@@ -258,16 +258,40 @@ constexpr uint32_t kPin_LED_Arr        = PB8;  /* TIM4_CH3        / PWM        *
 constexpr uint32_t kPin_LED_Extra      = PB9;  /* TIM4_CH4        / PWM        */
 
 /** [REQ-LED-003] PWM carrier frequency for every lighting channel.
- *  1 kHz is well above the perceptual flicker threshold of the human eye
- *  (~80 Hz at 100 % modulation), well below the audible range of the
- *  VNQ5E050AKTR-E quad high-side switch and its bond wires (no whistle),
- *  and gives an 8-bit duty step of ~3.9 us at 72 MHz APB1 clock - more
- *  than wide enough that the FET reaches steady state before the next
- *  edge.  Pinned here as a named constant so PB4 / PB5 (TIM3 partial
- *  remap) and PB8 / PB9 (TIM4) share one single source of truth instead
- *  of relying on the framework default `PWM_FREQUENCY` (which is also
- *  1000 Hz today but is not part of any contract).                       */
-constexpr uint32_t kLedPwmFrequency_Hz = 1000UL;
+ *  2 kHz is well above the perceptual flicker threshold of the human eye
+ *  (~80 Hz at 100 % modulation) and stays well below the audible whistle
+ *  range of the VNQ5E050AKTR-E quad high-side switch.  At 2 kHz the
+ *  period is 500 us; an 8-bit duty step is ~1.95 us, still long enough
+ *  for the FET to reach steady state before the next edge (VNQ5E050AKTR-E
+ *  rise/fall time is < 1 us into a resistive load).
+ *
+ *  Pinned here as a named constant so PB4 / PB5 (TIM3 partial remap) and
+ *  PB8 / PB9 (TIM4) share one single source of truth instead of relying
+ *  on the framework default `PWM_FREQUENCY` (which is 1 kHz on this
+ *  variant but is not part of any contract).                            */
+constexpr uint32_t kLedPwmFrequency_Hz = 2000UL;
+
+/** [REQ-LED-004] VNQ5E050AKTR-E "cold-start kick".
+ *  The quad smart high-side switch has an internal charge pump that takes
+ *  several PWM cycles to reach steady state.  If the very first non-zero
+ *  commanded duty after the channel was OFF is below `kLedKickThreshold_pct`,
+ *  the LED driver briefly pulses the channel at `kLedKickDuty_pct` for
+ *  `kLedKickHold_ms`, then settles at the host-commanded duty.  The kick
+ *  fires only on cold transitions (OFF -> low duty); transitions between
+ *  two non-zero duties (e.g. ramping 5 %->6 %->7 %) do NOT trigger a kick,
+ *  so live ramps from the host stay smooth.
+ *
+ *  `kLedKickHold_ms` is bounded well below `kIwdgTimeout_ms / 2`, so even
+ *  a worst-case `setAll(<40%)` (four sequential channel kicks) stays
+ *  inside one IWDG window without an explicit watchdog kick.            */
+constexpr uint8_t  kLedKickThreshold_pct = 40U;
+constexpr uint8_t  kLedKickDuty_pct      = 40U;
+constexpr uint32_t kLedKickHold_ms       = 50UL;
+
+static_assert(kLedKickDuty_pct >= kLedKickThreshold_pct,
+              "Kick duty must be >= kick threshold");
+static_assert(kLedKickDuty_pct <= 100U,
+              "Kick duty must be a valid duty percentage");
 
 /* --- TPS2HB16AQPWPRQ1 winch lock high-side switch -------------------------
  *  Dual-channel smart high-side switch.  These pins drive the channel enable

@@ -8,11 +8,20 @@
  *                 to eliminate any reconfiguration glitch on the input pin
  *                 of the VNQ5E050AKTR-E quad smart switch.
  *  [REQ-LED-003]  The PWM carrier frequency for every lighting channel is
- *                 fixed at `cfg::kLedPwmFrequency_Hz` (1 kHz).  The frequency
+ *                 fixed at `cfg::kLedPwmFrequency_Hz` (2 kHz).  The frequency
  *                 is asserted at init() time AND re-asserted immediately
  *                 before every analogWrite() so that any module that later
  *                 calls analogWriteFrequency() (a framework-global setting)
  *                 cannot silently drift the LED carrier rate.
+ *  [REQ-LED-004]  When a host command sets a channel from OFF to a duty
+ *                 below `cfg::kLedKickThreshold_pct`, the driver briefly
+ *                 pulses the channel at `cfg::kLedKickDuty_pct` for
+ *                 `cfg::kLedKickHold_ms`, then settles at the commanded
+ *                 duty.  This wakes the VNQ5E050AKTR-E internal charge
+ *                 pump so the high-side FET reaches full enhancement
+ *                 before being asked to switch at a low duty.  The kick
+ *                 fires only on COLD transitions (previous duty was 0):
+ *                 ramping 5 %->6 %->7 % does NOT re-trigger it.
  * =============================================================================
  */
 #include "leds.h"
@@ -35,10 +44,16 @@ constexpr uint32_t kPinMap[kChannels] = {
     cfg::kPin_LED_Extra,
 };
 
-uint8_t  s_duty[kChannels] = {0U, 0U, 0U, 0U};
-Pattern  s_pattern         = Pattern::kOff;
-uint32_t s_pattern_t0_ms   = 0U;
-bool     s_initialised     = false;
+uint8_t  s_duty[kChannels]    = {0U, 0U, 0U, 0U};
+/* [REQ-LED-004] Per-channel "currently driving non-zero PWM" latch.
+ * Set true on every non-zero analogWrite() through `writeRaw`, cleared
+ * back to false whenever the channel is forced to OFF via GPIO LOW.
+ * The cold-start kick only fires when this latch is false at the moment
+ * a non-zero duty command arrives.                                       */
+bool     s_driven[kChannels]  = {false, false, false, false};
+Pattern  s_pattern            = Pattern::kOff;
+uint32_t s_pattern_t0_ms      = 0U;
+bool     s_initialised        = false;
 
 inline uint8_t dutyToPwm(uint8_t duty_pct) {
   /* Clamp to [0..100] then map to the Arduino 0..255 PWM range.            */
@@ -60,7 +75,7 @@ void writeOffViaGpio(uint32_t pin) {
 }
 
 /* [REQ-LED-003] Single funnel for every LED analogWrite.  Re-asserts the
- * 1 kHz carrier frequency immediately before the analogWrite() so that the
+ * 2 kHz carrier frequency immediately before the analogWrite() so that the
  * framework's pwm_start() path (which reads `_writeFreq` and pushes it into
  * TIM3/TIM4 ARR via setOverflow(..., HERTZ_FORMAT)) always reconfigures the
  * timer to the LED-module-owned rate, regardless of what any other module
@@ -70,6 +85,20 @@ void writeLedPwm(uint32_t pin, uint8_t pwm_0_255) {
   analogWrite(pin, pwm_0_255);
 }
 
+/* [REQ-LED-004] Command-path write for a single channel.  Implements the
+ * VNQ5E050AKTR-E cold-start kick:
+ *   - duty == 0 %             -> force GPIO LOW, clear the "driven" latch.
+ *   - duty >= kick threshold  -> direct write, set the "driven" latch.
+ *   - duty < kick threshold AND channel currently NOT driven (cold) ->
+ *         pulse at the kick duty for the configured hold time, then
+ *         settle at the commanded duty.
+ *   - duty < kick threshold AND channel already driven (warm) ->
+ *         direct write, no kick (this is how live ramps stay smooth).
+ *
+ * Bounded delay: the kick adds at most cfg::kLedKickHold_ms per cold
+ * channel.  Even the worst case (four channels kicked back-to-back from
+ * a single `leds::setAll(<threshold>)`) is 4 * kLedKickHold_ms, which
+ * fits inside one IWDG window without an explicit watchdog kick.        */
 void writeRaw(Channel ch, uint8_t duty_pct) {
   const uint8_t idx = static_cast<uint8_t>(ch);
   if (idx >= kChannels) {
@@ -77,9 +106,19 @@ void writeRaw(Channel ch, uint8_t duty_pct) {
   }
   if (duty_pct == 0U) {
     writeOffViaGpio(kPinMap[idx]);
+    s_driven[idx] = false;
     return;
   }
+
+  const bool cold        = !s_driven[idx];
+  const bool below_thres = (duty_pct < cfg::kLedKickThreshold_pct);
+  if (cold && below_thres) {
+    writeLedPwm(kPinMap[idx], dutyToPwm(cfg::kLedKickDuty_pct));
+    delay(cfg::kLedKickHold_ms);
+  }
+
   writeLedPwm(kPinMap[idx], dutyToPwm(duty_pct));
+  s_driven[idx] = true;
 }
 
 }  // namespace
@@ -89,7 +128,7 @@ Status init() {
     return Status::kOk;
   }
   /* [REQ-LED-003] Lock the framework-global PWM frequency to the
-   * LED-module-owned 1 kHz carrier BEFORE any analogWrite() so the very
+   * LED-module-owned 2 kHz carrier BEFORE any analogWrite() so the very
    * first non-zero duty already comes out at the right rate.  The same
    * value is re-asserted before each subsequent analogWrite() via
    * `writeLedPwm()` to defend against any future module changing it.       */
@@ -97,7 +136,8 @@ Status init() {
 
   for (uint8_t i = 0U; i < kChannels; ++i) {
     writeOffViaGpio(kPinMap[i]);
-    s_duty[i] = 0U;
+    s_duty[i]    = 0U;
+    s_driven[i]  = false;
   }
   s_pattern       = Pattern::kOff;
   s_pattern_t0_ms = millis();
@@ -143,8 +183,12 @@ Status setPattern(Pattern p) {
   if (p == Pattern::kOff) {
     for (uint8_t i = 0U; i < kChannels; ++i) {
       writeOffViaGpio(kPinMap[i]);
+      s_driven[i] = false;
     }
   } else if (p == Pattern::kSolid) {
+    /* [REQ-LED-004] Going back to solid mode counts as a command receipt
+     * per channel: writeRaw() will cold-start-kick any channel whose
+     * stored duty is below kLedKickThreshold_pct.                       */
     for (uint8_t i = 0U; i < kChannels; ++i) {
       writeRaw(static_cast<Channel>(i), s_duty[i]);
     }
@@ -160,15 +204,24 @@ void tick() {
   const uint32_t dt  = now - s_pattern_t0_ms;
 
   /* Helper to push a duty to every channel for blink / strobe patterns
-   * while honouring [REQ-LED-002]: 0 % must always be a GPIO LOW, and
-   * [REQ-LED-003]: every PWM write goes through the LED funnel that
-   * re-asserts the 1 kHz carrier.                                          */
+   * while honouring:
+   *   [REQ-LED-002] 0 % must always be a GPIO LOW;
+   *   [REQ-LED-003] every PWM write goes through the LED funnel that
+   *                 re-asserts the 2 kHz carrier;
+   *   [REQ-LED-004] blink/strobe refreshes intentionally bypass the
+   *                 cold-start kick (the patterns only ever drive 0 %
+   *                 or >= 70 %, so a kick would never apply anyway, and
+   *                 a per-tick delay would destroy the pattern timing).
+   * The `s_driven[]` latch IS still maintained so a subsequent solid /
+   * setDuty command sees a coherent "channel currently driven?" state. */
   auto driveAll = [&](uint8_t duty) {
     for (uint8_t i = 0U; i < kChannels; ++i) {
       if (duty == 0U) {
         writeOffViaGpio(kPinMap[i]);
+        s_driven[i] = false;
       } else {
         writeLedPwm(kPinMap[i], dutyToPwm(duty));
+        s_driven[i] = true;
       }
     }
   };
