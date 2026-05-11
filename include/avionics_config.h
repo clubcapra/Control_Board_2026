@@ -96,6 +96,64 @@ constexpr double kI24VMax_A = 20.0;
  * --------------------------------------------------------------------------- */
 constexpr double kI12VMax_A = 10.0;
 
+/* ===========================================================================
+ *  3b) Q-FORMAT INTEGER MIRRORS  [REQ-PWR-Q1]   (residual R2)
+ *  ---------------------------------------------------------------------------
+ *  Aerospace coding standards (DO-178C Level A, JPL Power-of-10 #4) prohibit
+ *  IEEE-754 floating-point in safety-critical decision paths because of the
+ *  unbounded ULP error and the platform-specific rounding behaviour.
+ *
+ *  This block mirrors every protection threshold as a Q1.0 integer in
+ *  milli-units (mA / mV / mW / 0.1 degC).  When SW-side autonomous
+ *  protection is re-enabled (currently disabled because `kHotswapApiOnly`
+ *  is true), the trip path uses ONLY these integer constants and the
+ *  instantaneous reading is converted to mA at one well-defined point.
+ *
+ *  Conversion rule (engineering -> Q-format):
+ *      mA   = round(amperes  * 1000)
+ *      mV   = round(volts    * 1000)
+ *      mW   = round(watts    * 1000)
+ *      d10C = round(celsius  *   10)
+ *
+ *  Range: int32_t covers up to +/- 2 147 483 mA / mV / mW which is more
+ *  than enough for the 48 V x 200 A x 9.6 kW operating envelope.
+ * =========================================================================== */
+constexpr int32_t kI48VContinuous_mA  = 70000;     /* 70.0 A */
+constexpr int32_t kI48VWarn3min_mA    = 80000;     /* 80.0 A */
+constexpr int32_t kI48VWarn1min_mA    = 100000;    /* 100.0 A */
+constexpr int32_t kI48VPeakInstant_mA = 150000;    /* 150.0 A */
+constexpr int32_t kI24VMax_mA         = 20000;     /* 20.0 A */
+constexpr int32_t kI12VMax_mA         = 10000;     /* 10.0 A */
+
+/* Cross-check the float and integer mirrors at compile time.  Any future
+ * edit to one block that forgets the other will fail the build.          */
+static_assert(static_cast<int32_t>(kI48VContinuous_A * 1000.0) ==
+              kI48VContinuous_mA,
+              "Q-format mirror must match double for kI48VContinuous");
+static_assert(static_cast<int32_t>(kI48VWarn3min_A   * 1000.0) ==
+              kI48VWarn3min_mA,
+              "Q-format mirror must match double for kI48VWarn3min");
+static_assert(static_cast<int32_t>(kI48VWarn1min_A   * 1000.0) ==
+              kI48VWarn1min_mA,
+              "Q-format mirror must match double for kI48VWarn1min");
+static_assert(static_cast<int32_t>(kI48VPeakInstant_A * 1000.0) ==
+              kI48VPeakInstant_mA,
+              "Q-format mirror must match double for kI48VPeakInstant");
+static_assert(static_cast<int32_t>(kI24VMax_A * 1000.0) == kI24VMax_mA,
+              "Q-format mirror must match double for kI24VMax");
+static_assert(static_cast<int32_t>(kI12VMax_A * 1000.0) == kI12VMax_mA,
+              "Q-format mirror must match double for kI12VMax");
+
+/* Helper for runtime conversion at the LM5066H1 HAL boundary.  Intended
+ * to be used exactly once per sample, immediately after each
+ * `device_.readIin(double&)`, before any protection comparison.          */
+constexpr int32_t amperesToMilliAmp_q1(double amperes) {
+  return static_cast<int32_t>(amperes * 1000.0);
+}
+constexpr int32_t voltsToMilliVolt_q1(double volts) {
+  return static_cast<int32_t>(volts * 1000.0);
+}
+
 /* ---------------------------------------------------------------------------
  *  Sampling cadence of the software protection layer.  Must be fast enough
  *  that, even at the upper end of the inverse-time curve, the firmware can
@@ -122,15 +180,21 @@ constexpr double kOtWarn_C  = 100.0;
 constexpr double kOtFault_C = 125.0;
 
 /* Hot-swap enable/disable policy:
- *   false  -> the STM32 turns all rails ON once at boot (after configureDevice)
- *             and honours estop / API commands with one-shot writes.
- *   true   -> the STM32 never writes OPERATION; RG is solely responsible for
- *             commanding each rail on via the control API.
+ *   false  -> the STM32 turns all rails ON once at boot, disables them on
+ *             E-Stop, and honours RG API commands with one-shot writes.
+ *   true   -> the STM32 NEVER autonomously writes OPERATION: no boot-time
+ *             auto-enable, no E-Stop auto-disable, no SW-protection trip
+ *             sends OPERATION=0.  Rails go ON/OFF only in response to an
+ *             explicit `kSetRailEnable` command from RG over the I2C2 API
+ *             (which still routes through Controller::enable/disable and
+ *             writes OPERATION).  The LM5066H1's hardware breaker remains
+ *             active in either mode and trips on its own when the analog
+ *             OC threshold is exceeded.
  *
  * Either way, tick() never re-asserts OPERATION: each enable() or disable()
  * is a single write, and the LM5066H1's own infinite retry (retrySetting = 7)
  * handles fault recovery without STM32 intervention.                          */
-constexpr bool kHotswapApiOnly = false;
+constexpr bool kHotswapApiOnly = true;
 
 /* ===========================================================================
  *  5) NTC thermistor parameters (each rail has its own NTC near the MOSFET)

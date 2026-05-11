@@ -33,6 +33,12 @@ Status init() {
   if (s_initialised) {
     return Status::kOk;
   }
+  /* [REQ-LOCK-001] Guarantee both lock outputs are at LOW (TPS2HB16AQ
+   * disabled) before, during, and after switching the pin to output mode.
+   * The pre-write makes the ODR LOW even if the pin happened to come up
+   * in alternate-function or input mode.                                  */
+  digitalWrite(cfg::kPin_WinchLock1_EN, LOW);
+  digitalWrite(cfg::kPin_WinchLock2_EN, LOW);
   pinMode(cfg::kPin_WinchLock1_EN, OUTPUT);
   pinMode(cfg::kPin_WinchLock2_EN, OUTPUT);
   writeLock1(false);

@@ -50,6 +50,12 @@ class PduSilentConsole {
 
   template <typename... Args>
   void println(Args...) {}
+
+  /* Stubs for the Arduino Print API write() variants we actually use. */
+  size_t write(uint8_t /*b*/) { return 0U; }
+  size_t write(const uint8_t* /*buf*/, size_t len) { return len; }
+  size_t write(const char* /*str*/) { return 0U; }
+  size_t write(int /*c*/) { return 0U; }
 };
 
 #if defined(PDU_USE_SWO) && \

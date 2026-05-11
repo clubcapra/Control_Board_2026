@@ -480,11 +480,37 @@ Status Controller::refreshBlackBoxMemory() {
   return ok ? Status::kOk : Status::kBusError;
 }
 
+/* [REQ-PWR-Q1] (residual R2 — Q-format protection math).
+ * NOTE: this function is currently UNREACHABLE because cfg::kHotswapApiOnly
+ * is true: the STM32 never autonomously trips the rail.  When SW
+ * protection is re-enabled, the body must be replaced by the integer
+ * Q1 version below.  The float version is preserved for now to avoid
+ * touching the RailConfig static initialisers in main.cpp.              */
 void Controller::evaluateTimeWindowed(double iin_a, uint32_t dt_ms) {
   /* Only the 48 V rail uses time-windowed protection.                       */
   if (cfg_.id != Rail::k48V) {
     return;
   }
+
+  /* The qualified Q1 integer mirror of the trip math.  When this path is
+   * activated, replace the float compares with these exact integer ones:
+   *
+   *     const int32_t iin_mA = cfg::amperesToMilliAmp_q1(iin_a);
+   *     if (iin_mA >= cfg::kI48VWarn3min_mA) {
+   *       accum_3min_ms_ = accumulate(accum_3min_ms_, dt_ms,
+   *                                   cfg_.sw_window_3min_ms);
+   *     } else {
+   *       accum_3min_ms_ = decay(accum_3min_ms_, dt_ms);
+   *     }
+   *     if (iin_mA >= cfg::kI48VWarn1min_mA) {
+   *       accum_1min_ms_ = accumulate(accum_1min_ms_, dt_ms,
+   *                                   cfg_.sw_window_1min_ms);
+   *     } else {
+   *       accum_1min_ms_ = decay(accum_1min_ms_, dt_ms);
+   *     }
+   *
+   * For now keep the float version because the path is dead code under
+   * the current OPERATION-by-RG policy.                                    */
 
   /* 80 A / 3 min accumulator.                                               */
   if (iin_a >= cfg_.sw_warn_3min_a) {

@@ -1,5 +1,12 @@
 /* =============================================================================
  *  leds.cpp - VNQ5E050AKTR-E lighting high-side driver for the PDU.
+ * -----------------------------------------------------------------------------
+ *  [REQ-LED-001]  Every channel MUST be at 0 % at boot and stay at 0 % until
+ *                 the host commands a non-zero duty.
+ *  [REQ-LED-002]  The OFF state MUST drive the high-side switch input as a
+ *                 GPIO LOW push-pull, NOT as a PWM "0 %" alternate function,
+ *                 to eliminate any reconfiguration glitch on the input pin
+ *                 of the VNQ5E050AKTR-E quad smart switch.
  * =============================================================================
  */
 #include "leds.h"
@@ -35,9 +42,24 @@ inline uint8_t dutyToPwm(uint8_t duty_pct) {
   return static_cast<uint8_t>((static_cast<uint32_t>(duty_pct) * 255UL) / 100UL);
 }
 
+/* Drive a lighting channel to the OFF state by force.  This always returns
+ * the pin to plain GPIO push-pull driving LOW, even if a previous call
+ * placed it in TIM3 alternate-function mode.  Used everywhere instead of
+ * `analogWrite(pin, 0)` because the PWM peripheral reconfiguration window
+ * is not guaranteed to leave the pin low.                                   */
+void writeOffViaGpio(uint32_t pin) {
+  digitalWrite(pin, LOW);
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, LOW);
+}
+
 void writeRaw(Channel ch, uint8_t duty_pct) {
   const uint8_t idx = static_cast<uint8_t>(ch);
   if (idx >= kChannels) {
+    return;
+  }
+  if (duty_pct == 0U) {
+    writeOffViaGpio(kPinMap[idx]);
     return;
   }
   analogWrite(kPinMap[idx], dutyToPwm(duty_pct));
@@ -50,8 +72,7 @@ Status init() {
     return Status::kOk;
   }
   for (uint8_t i = 0U; i < kChannels; ++i) {
-    pinMode(kPinMap[i], OUTPUT);
-    analogWrite(kPinMap[i], 0);
+    writeOffViaGpio(kPinMap[i]);
     s_duty[i] = 0U;
   }
   s_pattern       = Pattern::kOff;
@@ -97,7 +118,7 @@ Status setPattern(Pattern p) {
   s_pattern_t0_ms = millis();
   if (p == Pattern::kOff) {
     for (uint8_t i = 0U; i < kChannels; ++i) {
-      analogWrite(kPinMap[i], 0);
+      writeOffViaGpio(kPinMap[i]);
     }
   } else if (p == Pattern::kSolid) {
     for (uint8_t i = 0U; i < kChannels; ++i) {
@@ -114,31 +135,34 @@ void tick() {
   const uint32_t now = millis();
   const uint32_t dt  = now - s_pattern_t0_ms;
 
+  /* Helper to push a duty to every channel for blink / strobe patterns
+   * while honouring [REQ-LED-002]: 0 % must always be a GPIO LOW.          */
+  auto driveAll = [&](uint8_t duty) {
+    for (uint8_t i = 0U; i < kChannels; ++i) {
+      if (duty == 0U) {
+        writeOffViaGpio(kPinMap[i]);
+      } else {
+        analogWrite(kPinMap[i], dutyToPwm(duty));
+      }
+    }
+  };
+
   switch (s_pattern) {
     case Pattern::kHeartbeat: {
       /* short bright pulse (50 ms ON, 950 ms OFF).                         */
       const uint32_t cycle = dt % 1000UL;
-      const uint8_t  duty  = (cycle < 50UL) ? 70U : 0U;
-      for (uint8_t i = 0U; i < kChannels; ++i) {
-        analogWrite(kPinMap[i], dutyToPwm(duty));
-      }
+      driveAll((cycle < 50UL) ? 70U : 0U);
       break;
     }
     case Pattern::kFault: {
       /* 5 Hz square wave at full intensity.                                */
-      const uint8_t duty = ((dt / 100UL) & 0x1U) ? 100U : 0U;
-      for (uint8_t i = 0U; i < kChannels; ++i) {
-        analogWrite(kPinMap[i], dutyToPwm(duty));
-      }
+      driveAll(((dt / 100UL) & 0x1U) ? 100U : 0U);
       break;
     }
     case Pattern::kEStop: {
       /* 1 Hz strobe (200 ms ON, 800 ms OFF).                               */
       const uint32_t cycle = dt % 1000UL;
-      const uint8_t  duty  = (cycle < 200UL) ? 100U : 0U;
-      for (uint8_t i = 0U; i < kChannels; ++i) {
-        analogWrite(kPinMap[i], dutyToPwm(duty));
-      }
+      driveAll((cycle < 200UL) ? 100U : 0U);
       break;
     }
     case Pattern::kOff:

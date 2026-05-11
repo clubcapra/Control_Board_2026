@@ -53,7 +53,42 @@ class SerialSWOClass : public Print {
 
   size_t write(uint8_t b) override {
 #if defined(__CORTEX_M) && (__CORTEX_M >= 3)
-    (void)ITM_SendChar(b);
+    /* Bounded substitute for the unbounded CMSIS ITM_SendChar.
+     *
+     * The CMSIS implementation does
+     *     while (ITM->PORT[0U].u32 == 0UL) { __NOP(); }
+     * which spins forever when nobody is draining the SWO/TPIU FIFO -
+     * exactly the case when the firmware boots without an ST-Link
+     * (DBGMCU is power-gated, the TPIU never empties the 32-entry FIFO,
+     * and the very first burst of Serial.print blocks the CPU until the
+     * IWDG resets it).  That triggers a permanent reset loop because the
+     * banner-print on the next boot re-blocks the moment the loop hits
+     * Serial.print.
+     *
+     * We replace it with a bounded wait: try briefly for FIFO space, and
+     * if none appears within a fraction of a SWO byte time, drop the
+     * character on the floor.  The chip stays alive, the IWDG keeps
+     * getting kicked, and trace just goes silent when the host can't
+     * keep up - which is the right policy for a flight controller.   */
+    if (((ITM->TCR & ITM_TCR_ITMENA_Msk) != 0UL) &&
+        ((ITM->TER & 1UL)               != 0UL)) {
+      /* The SWO FIFO is 32 entries, draining at the TPIU bit-rate
+       * (~5 us / byte at 2 Mbps NRZ).  A whole-FIFO drain is therefore
+       * ~150 us, plus margin for ST-Link host buffering.  We give the
+       * write up to ~3 ms of busy-wait at 72 MHz before dropping the
+       * byte.  3 ms is small relative to the 2 s healthy-loop budget, so
+       * the IWDG cannot fire because of it; but it is plenty to outlast
+       * any normal back-pressure spike, which kills the scrambled-text
+       * problem we used to get when the 64-iteration guard expired
+       * mid-burst and threw bytes on the floor.                          */
+      uint32_t guard = 200000U;
+      while ((ITM->PORT[0U].u32 == 0UL) && (--guard != 0U)) {
+        __NOP();
+      }
+      if (guard != 0U) {
+        ITM->PORT[0U].u8 = b;
+      }
+    }
 #else
     (void)b;
 #endif

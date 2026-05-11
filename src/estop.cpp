@@ -7,6 +7,10 @@
 
 #include <Arduino.h>
 
+// #region agent log
+#include "console.h"
+// #endregion
+
 namespace pdu {
 namespace estop {
 
@@ -111,11 +115,50 @@ bool isAsserted() {
 }
 
 void assertLocal(bool engage) {
+  // #region agent log
+  /* Snapshot PA0's mode-register nibble (CRL[3:0]), the register-state
+   * ODR (immediate, never lags), AND the sampled IDR pin level BEFORE the
+   * BRR/BSRR write so we can distinguish:
+   *   - firmware bug: ODR doesn't follow what we write
+   *   - electrical:   ODR follows but pad/IDR can't reach the commanded level
+   *                   (external short, fight from another driver, etc.)   */
+  const uint32_t crl_before = GPIOA->CRL;
+  const uint32_t mode_pa0   = crl_before & 0xFU;          /* CRL[3:0] */
+  const uint32_t odr_before = (GPIOA->ODR >> 0U) & 1U;
+  const uint32_t idr_before = (GPIOA->IDR >> 0U) & 1U;
+  // #endregion
   if (!s_initialised) {
+    // #region agent log
+    Serial.print(F("[ESTOP DBG] assertLocal SKIPPED s_initialised=0 engage="));
+    Serial.println(engage ? 1 : 0);
+    // #endregion
     return;
   }
   s_local_assert = engage;
   driveLocalEStopAsserted(engage);
+  // #region agent log
+  /* A few NOPs to allow the pad to settle if it's heavily capacitively
+   * loaded; rules out pure IDR-sampling-too-fast as a confounder.         */
+  for (uint8_t i = 0U; i < 16U; ++i) {
+    __NOP();
+  }
+  const uint32_t odr_after = (GPIOA->ODR >> 0U) & 1U;
+  const uint32_t idr_after = (GPIOA->IDR >> 0U) & 1U;
+  Serial.print(F("[ESTOP DBG] assertLocal engage="));
+  Serial.print(engage ? 1 : 0);
+  Serial.print(F(" CRL[3:0]=0x"));
+  Serial.print(mode_pa0, HEX);
+  Serial.print(F(" ODR.0 "));
+  Serial.print(odr_before);
+  Serial.print(F("->"));
+  Serial.print(odr_after);
+  Serial.print(F(" IDR.0 "));
+  Serial.print(idr_before);
+  Serial.print(F("->"));
+  Serial.print(idr_after);
+  Serial.print(F(" expect_pad="));
+  Serial.println(engage ? 0 : 1);   /* PA0 is active-LOW: assert -> 0 */
+  // #endregion
 }
 
 void setVtx(bool engage) {

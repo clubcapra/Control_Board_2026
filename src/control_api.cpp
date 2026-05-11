@@ -968,52 +968,167 @@ static void rearmListenIfStuck() {
     return;
   }
 
-  const uint32_t cr1 = h->Instance->CR1;
-  const bool pe_set      = (cr1 & I2C_CR1_PE)  != 0U;
-  const bool ack_set     = (cr1 & I2C_CR1_ACK) != 0U;
-  const bool state_listen = (h->State == HAL_I2C_STATE_LISTEN);
+  /* Atomically snapshot CR1 and h->State once.  The recovery decision and
+   * the diagnostic printout MUST agree on the same observation; a re-read
+   * later races with the I2C2 ISR and produces misleading log lines (and,
+   * worse, false-positive recoveries that tear down legitimate in-progress
+   * transfers).                                                          */
+  const uint32_t                cr1       = h->Instance->CR1;
+  const HAL_I2C_StateTypeDef    state_now = h->State;
+  const bool pe_set       = (cr1 & I2C_CR1_PE)  != 0U;
+  const bool ack_set      = (cr1 & I2C_CR1_ACK) != 0U;
+  const bool state_listen = (state_now == HAL_I2C_STATE_LISTEN);
+  const bool state_busy   = (state_now == HAL_I2C_STATE_BUSY_TX_LISTEN ||
+                              state_now == HAL_I2C_STATE_BUSY_RX_LISTEN ||
+                              state_now == HAL_I2C_STATE_BUSY_TX ||
+                              state_now == HAL_I2C_STATE_BUSY_RX);
+
+  /* Stuck-state fingerprint: the F1 missed-STOPF errata leaves CR1.ACK
+   * cleared while the HAL state stays in BUSY_*_LISTEN.  Real slave
+   * transfers complete in microseconds and only clear ACK momentarily on
+   * the last received byte, so observing (state_busy && !ack_set) for
+   * >100 ms is a precise, race-free detector of the actual stuck state
+   * we observed in the log (CR1=0x1, hal=0x2A, frozen rx#/tx#).         */
+  const uint32_t now_ms_p = millis();
+  static uint32_t s_stuck_since_ms = 0U;
+  const bool stuck_pattern = state_busy && !ack_set;
+  if (stuck_pattern) {
+    if (s_stuck_since_ms == 0U) {
+      s_stuck_since_ms = now_ms_p;
+    }
+  } else {
+    s_stuck_since_ms = 0U;
+  }
+  const uint32_t stuck_ms = (s_stuck_since_ms != 0U)
+                                ? (now_ms_p - s_stuck_since_ms)
+                                : 0U;
+  const bool busy_too_long = (s_stuck_since_ms != 0U) && (stuck_ms >= 100U);
+
+  /* Rate-limit recoveries to once per 2 s as a backstop in case the
+   * detector still has edge cases - prevents a runaway recovery loop
+   * from starving the foreground and tripping the IWDG.                  */
+  static uint32_t s_last_recov_ms = 0U;
+  const bool recov_rate_limited =
+      (s_last_recov_ms != 0U) && ((now_ms_p - s_last_recov_ms) < 2000U);
+
+  /* Used by the diagnostic dump below so the silent_ms field still reads
+   * meaningfully even though we now use a different gating signal.       */
+  uint32_t rx_now_p, tx_now_p;
+  noInterrupts();
+  rx_now_p = s_dbg_rx_count;
+  tx_now_p = s_dbg_tx_count;
+  interrupts();
+  static uint32_t s_last_progress_ms = 0U;
+  static uint32_t s_last_seen_rx     = 0U;
+  static uint32_t s_last_seen_tx     = 0U;
+  if (rx_now_p != s_last_seen_rx ||
+      tx_now_p != s_last_seen_tx ||
+      s_last_progress_ms == 0U) {
+    s_last_seen_rx     = rx_now_p;
+    s_last_seen_tx     = tx_now_p;
+    s_last_progress_ms = now_ms_p;
+  }
+  const uint32_t silent_ms = now_ms_p - s_last_progress_ms;
 
   // #region agent log
-  /* Throttled snapshot every 250 ms regardless of action - so we can see
-   * if the peripheral looks "fine" (PE=ACK=1, state=LISTEN) but is
-   * actually NACKing because of a stuck error/BUSY flag.                  */
+  /* Two-tier diagnostic:
+   *   1) Coarse heartbeat once per second (proves we got into rearm tick
+   *      and dumps the peripheral snapshot).
+   *   2) Silence detector: if rx_count AND tx_count have not advanced for
+   *      >3 s while the peripheral state looks "healthy" (PE=ACK=1,
+   *      LISTEN), fire ONCE so we capture the exact moment RG stops
+   *      seeing transactions.  This is the symptom the user describes
+   *      ("I2C RG at some random point stops communicating") and is
+   *      currently not caught by the regular rearmListenIfStuck logic
+   *      because all the visible flags still look correct.               */
   {
-    static uint32_t s_dbg_last_ms = 0U;
+#if defined(PDU_VERBOSE_DEBUG)
+    static uint32_t s_dbg_last_ms        = 0U;
+#endif
+    static uint32_t s_dbg_last_rx        = 0U;
+    static uint32_t s_dbg_last_tx        = 0U;
+    static uint32_t s_dbg_last_change_ms = 0U;
+    static bool     s_dbg_silence_fired  = false;
     const uint32_t now_ms = millis();
-    if ((now_ms - s_dbg_last_ms) >= 250U) {
+    uint32_t rx_now, tx_now;
+    noInterrupts();
+    rx_now = s_dbg_rx_count;
+    tx_now = s_dbg_tx_count;
+    interrupts();
+    if (rx_now != s_dbg_last_rx || tx_now != s_dbg_last_tx) {
+      s_dbg_last_rx        = rx_now;
+      s_dbg_last_tx        = tx_now;
+      s_dbg_last_change_ms = now_ms;
+      s_dbg_silence_fired  = false;
+    }
+#if defined(PDU_VERBOSE_DEBUG)
+    if ((now_ms - s_dbg_last_ms) >= 1000U) {
       s_dbg_last_ms = now_ms;
       dbgDumpI2c2State("tick");
+    }
+#endif
+    /* Fire on ANY 3 s of frozen rx/tx counters, regardless of CR1/state.
+     * This catches both the "looks-healthy-but-deaf" case and the
+     * "stuck-in-BUSY_RX_LISTEN" case we just observed.                   */
+    if (!s_dbg_silence_fired &&
+        s_dbg_last_change_ms != 0U &&
+        (now_ms - s_dbg_last_change_ms) >= 3000U) {
+      s_dbg_silence_fired = true;
+      Serial.print(F("[I2C2 STALL] silent for "));
+      Serial.print(now_ms - s_dbg_last_change_ms);
+      Serial.print(F("ms; rx#="));
+      Serial.print(rx_now);
+      Serial.print(F(" tx#="));
+      Serial.println(tx_now);
+      dbgDumpI2c2State("stall");
     }
   }
   // #endregion
 
-  /* If we're properly armed, leave it alone. */
+  /* Healthy: leave alone. */
   if (pe_set && ack_set && state_listen) {
     return;
   }
 
-  /* If a transfer is genuinely in progress (we just clocked into BUSY_TX_LISTEN
-   * via AddrCallback and the master is mid-byte), don't tear it down.       */
-  if (h->State == HAL_I2C_STATE_BUSY_TX_LISTEN ||
-      h->State == HAL_I2C_STATE_BUSY_RX_LISTEN ||
-      h->State == HAL_I2C_STATE_BUSY_TX ||
-      h->State == HAL_I2C_STATE_BUSY_RX) {
+  /* In-progress transfer that does NOT match the stuck fingerprint:
+   * leave alone.  Real transfers complete in microseconds; the only
+   * BUSY_* state worth tearing down is the missed-STOPF errata one,
+   * detected by (state_busy && !ack_set) sustained for >100 ms above.   */
+  if (state_busy && !busy_too_long) {
     return;
   }
 
+  /* Recovery rate-limit backstop. */
+  if (recov_rate_limited) {
+    return;
+  }
+  s_last_recov_ms = now_ms_p;
+
   // #region agent log
-  Serial.println(F("[I2C2 RECOV] re-arming stuck slave"));
+  Serial.print(F("[I2C2 RECOV] re-arming stuck slave (state=0x"));
+  Serial.print((uint32_t)state_now, HEX);
+  Serial.print(F(" CR1=0x"));
+  Serial.print(cr1, HEX);
+  Serial.print(F(" stuck_ms="));
+  Serial.print(stuck_ms);
+  Serial.print(F(" silent_ms="));
+  Serial.print(silent_ms);
+  Serial.println(F(")"));
   dbgDumpI2c2State("pre-reset");
   // #endregion
 
-  /* Otherwise force the peripheral back to a known-good READY state and
-   * re-enable Listen mode + ACK + EVT/ERR interrupts.                       */
+  /* Force the peripheral back to a known-good READY state and re-enable
+   * Listen mode + ACK + EVT/ERR interrupts.                              */
   __HAL_I2C_DISABLE(h);
   h->Instance->CR1 |= I2C_CR1_SWRST;
   h->Instance->CR1 &= ~I2C_CR1_SWRST;
   h->State = HAL_I2C_STATE_RESET;
   (void)HAL_I2C_Init(h);
   (void)HAL_I2C_EnableListen_IT(h);
+
+  /* Reset trackers on the freshly-reinitialised handle. */
+  s_last_progress_ms = now_ms_p;
+  s_stuck_since_ms   = 0U;
 
   // #region agent log
   dbgDumpI2c2State("post-reset");

@@ -5,6 +5,7 @@
 #include "iwdg.h"
 #include "avionics_config.h"
 #include "fault_log.h"
+#include "pdu_hal.h"
 
 #include <Arduino.h>
 
@@ -57,7 +58,11 @@ void kick() {
     return;
   }
 #if PDU_IWDG_BACKEND_STM32
-  IWatchdog.reload();
+  /* [REQ-LOOP-099] Foreground watchdog refresh.  Routed through the
+   * qualified-primitives layer (raw IWDG->KR write) instead of the
+   * unqualified `IWatchdog.reload()` HAL wrapper.  This keeps the hot
+   * path inside the qualifiable code zone.                              */
+  pdu::hal::qualified::iwdgKick();
 #endif
 }
 
