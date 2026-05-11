@@ -7,6 +7,12 @@
  *                 GPIO LOW push-pull, NOT as a PWM "0 %" alternate function,
  *                 to eliminate any reconfiguration glitch on the input pin
  *                 of the VNQ5E050AKTR-E quad smart switch.
+ *  [REQ-LED-003]  The PWM carrier frequency for every lighting channel is
+ *                 fixed at `cfg::kLedPwmFrequency_Hz` (1 kHz).  The frequency
+ *                 is asserted at init() time AND re-asserted immediately
+ *                 before every analogWrite() so that any module that later
+ *                 calls analogWriteFrequency() (a framework-global setting)
+ *                 cannot silently drift the LED carrier rate.
  * =============================================================================
  */
 #include "leds.h"
@@ -53,6 +59,17 @@ void writeOffViaGpio(uint32_t pin) {
   digitalWrite(pin, LOW);
 }
 
+/* [REQ-LED-003] Single funnel for every LED analogWrite.  Re-asserts the
+ * 1 kHz carrier frequency immediately before the analogWrite() so that the
+ * framework's pwm_start() path (which reads `_writeFreq` and pushes it into
+ * TIM3/TIM4 ARR via setOverflow(..., HERTZ_FORMAT)) always reconfigures the
+ * timer to the LED-module-owned rate, regardless of what any other module
+ * may have set the global frequency to since the last call.                 */
+void writeLedPwm(uint32_t pin, uint8_t pwm_0_255) {
+  analogWriteFrequency(cfg::kLedPwmFrequency_Hz);
+  analogWrite(pin, pwm_0_255);
+}
+
 void writeRaw(Channel ch, uint8_t duty_pct) {
   const uint8_t idx = static_cast<uint8_t>(ch);
   if (idx >= kChannels) {
@@ -62,7 +79,7 @@ void writeRaw(Channel ch, uint8_t duty_pct) {
     writeOffViaGpio(kPinMap[idx]);
     return;
   }
-  analogWrite(kPinMap[idx], dutyToPwm(duty_pct));
+  writeLedPwm(kPinMap[idx], dutyToPwm(duty_pct));
 }
 
 }  // namespace
@@ -71,6 +88,13 @@ Status init() {
   if (s_initialised) {
     return Status::kOk;
   }
+  /* [REQ-LED-003] Lock the framework-global PWM frequency to the
+   * LED-module-owned 1 kHz carrier BEFORE any analogWrite() so the very
+   * first non-zero duty already comes out at the right rate.  The same
+   * value is re-asserted before each subsequent analogWrite() via
+   * `writeLedPwm()` to defend against any future module changing it.       */
+  analogWriteFrequency(cfg::kLedPwmFrequency_Hz);
+
   for (uint8_t i = 0U; i < kChannels; ++i) {
     writeOffViaGpio(kPinMap[i]);
     s_duty[i] = 0U;
@@ -136,13 +160,15 @@ void tick() {
   const uint32_t dt  = now - s_pattern_t0_ms;
 
   /* Helper to push a duty to every channel for blink / strobe patterns
-   * while honouring [REQ-LED-002]: 0 % must always be a GPIO LOW.          */
+   * while honouring [REQ-LED-002]: 0 % must always be a GPIO LOW, and
+   * [REQ-LED-003]: every PWM write goes through the LED funnel that
+   * re-asserts the 1 kHz carrier.                                          */
   auto driveAll = [&](uint8_t duty) {
     for (uint8_t i = 0U; i < kChannels; ++i) {
       if (duty == 0U) {
         writeOffViaGpio(kPinMap[i]);
       } else {
-        analogWrite(kPinMap[i], dutyToPwm(duty));
+        writeLedPwm(kPinMap[i], dutyToPwm(duty));
       }
     }
   };

@@ -253,9 +253,21 @@ constexpr uint32_t kPin_EStopVtx       = PB13;
  *  mapping unless extra ADC pins are assigned later.
  * --------------------------------------------------------------------------- */
 constexpr uint32_t kPin_LED_Bras       = PB4;  /* TIM3_CH1_REMAP / PWM         */
-constexpr uint32_t kPin_LED_Avant      = PB5;  /* schematic: LED Avant PWM     */
-constexpr uint32_t kPin_LED_Arr        = PB8;  /* schematic: LED Arri PWM      */
-constexpr uint32_t kPin_LED_Extra      = PB9;  /* schematic: LED Extra PWM     */
+constexpr uint32_t kPin_LED_Avant      = PB5;  /* TIM3_CH2_REMAP / PWM         */
+constexpr uint32_t kPin_LED_Arr        = PB8;  /* TIM4_CH3        / PWM        */
+constexpr uint32_t kPin_LED_Extra      = PB9;  /* TIM4_CH4        / PWM        */
+
+/** [REQ-LED-003] PWM carrier frequency for every lighting channel.
+ *  1 kHz is well above the perceptual flicker threshold of the human eye
+ *  (~80 Hz at 100 % modulation), well below the audible range of the
+ *  VNQ5E050AKTR-E quad high-side switch and its bond wires (no whistle),
+ *  and gives an 8-bit duty step of ~3.9 us at 72 MHz APB1 clock - more
+ *  than wide enough that the FET reaches steady state before the next
+ *  edge.  Pinned here as a named constant so PB4 / PB5 (TIM3 partial
+ *  remap) and PB8 / PB9 (TIM4) share one single source of truth instead
+ *  of relying on the framework default `PWM_FREQUENCY` (which is also
+ *  1000 Hz today but is not part of any contract).                       */
+constexpr uint32_t kLedPwmFrequency_Hz = 1000UL;
 
 /* --- TPS2HB16AQPWPRQ1 winch lock high-side switch -------------------------
  *  Dual-channel smart high-side switch.  These pins drive the channel enable
