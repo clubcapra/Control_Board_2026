@@ -24,6 +24,7 @@ entre la carte **RoboGuard** (STM32F446RE, maître) et le **PDU** sur Blue Pill
 | Horloge SCL                | **50 kHz**      |
 | Endianness des structures  | Little-endian   |
 | Encapsulation              | Packed, pas de padding |
+| **PEC (CRC8 SMBus)**       | **Activé à partir de la version protocole `1.10`** ([§ 7](#7-pec--crc8-smbus-req-api-040)) |
 
 ### Brochage
 
@@ -262,7 +263,96 @@ toutes les secondes :
 
 ---
 
-## 7. Références fichiers
+## 7. PEC — CRC8 SMBus [REQ-API-040]
+
+À partir de la **version de protocole `1.10`** (firmware PDU ≥ 1.0.0 / mai
+2026), chaque trame I²C de taille fixe transporte un octet de **PEC (Packet
+Error Code)** standard SMBus 2.0 / PMBus 1.x.
+
+### 7.1 Algorithme
+
+| Paramètre        | Valeur                                                      |
+|------------------|-------------------------------------------------------------|
+| Polynôme         | `0x07` (x⁸ + x² + x + 1)                                    |
+| Seed (état init.)| `0x00`                                                      |
+| Sens             | Pas de réflexion entrée/sortie, pas de XOR final            |
+| Position         | **Dernier octet** de chaque trame fixe (écriture ET lecture) |
+
+### 7.2 Couverture (octets inclus dans le calcul)
+
+```
+  WRITE  (RG -> PDU) :   crc8([ (addr<<1)|0 , reg , payload... ])
+  READ   (PDU -> RG) :   crc8([ (addr<<1)|0 , reg , (addr<<1)|1 , payload... ])
+```
+
+Avec `addr = 0x31`, donc `(addr<<1)|0 = 0x62` et `(addr<<1)|1 = 0x63`.
+
+### 7.3 Registres concernés
+
+| Registre              | Direction | Taille (octets) | PEC inclus  |
+|-----------------------|-----------|-----------------|-------------|
+| `kInfo`         `0x00`| R         | 16 + **1** = 17 | **Oui**     |
+| `kTelemetryAll` `0x10`| R         | 944             | **Non** *   |
+| `kCommand`      `0x20`| W         | 5 + **1** = 6   | **Oui**     |
+| `kCommandStatus``0x21`| R         | 8 + **1** = 9   | **Oui**     |
+| `kPmbusBridge`  `0x40`| W         | 28 + **1** = 29 | **Oui**     |
+| `kPmbusResult`  `0x41`| R         | 31 + **1** = 32 | **Oui**     |
+
+*\* Le tampon TX matériel de l'esclave (`I2C_TXRX_BUFFER_SIZE = 32`) ne peut
+pas faire passer la queue d'un payload de 944 octets, donc le PEC sur
+`kTelemetryAll` n'aurait jamais été lisible par le maître. La trame de
+télémétrie reste authentifiée par le `magic = "TLM1"` à l'offset 0.*
+
+### 7.4 Comportement de l'esclave en cas de PEC invalide
+
+1. La trame d'écriture est **silencieusement rejetée** :
+   - `s_command_pending` / `s_bridge_pending` n'est PAS armé,
+   - `s_command_result.sequence` n'avance pas,
+   - le compteur saturant `ApiInfo.pec_rx_errors` est incrémenté.
+
+2. Le maître détecte un rejet en observant **deux** symptômes simultanés :
+   - `seq` ne change pas après l'envoi de la commande,
+   - `ApiInfo.pec_rx_errors` a augmenté de 1 (ou plus, en cas de rafale).
+
+### 7.5 Implémentation de référence
+
+```c
+static uint8_t crc8_update(uint8_t crc, uint8_t byte) {
+    crc ^= byte;
+    for (int b = 0; b < 8; ++b) {
+        crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07) : (uint8_t)(crc << 1);
+    }
+    return crc;
+}
+```
+
+Source côté esclave : `src/control_api.cpp` (`crc8Update`, `crc8Buffer`,
+`pecSeedRead`, `pecSeedWrite`, `stampReadPec`, `verifyWritePec`).
+
+### 7.6 Champ `ApiInfo.features` et détection
+
+Le bit `0x01` du champ `ApiInfo.features` (offset 11) vaut **1** dès que le
+PEC est en service côté PDU. Le maître peut donc rester rétro-compatible :
+
+```c
+if (info.features & 0x01) {
+    /* PDU exige le PEC: ajouter un octet CRC8 sur toutes les écritures,
+     * lire un octet de plus sur toutes les lectures fixes.            */
+}
+```
+
+### 7.7 Impact mémoire
+
+- Flash PDU : **+~320 octets** (96,0 % → 96,5 %).
+- RAM PDU : 0 octet supplémentaire (les structures grandissent mais
+  `noInterrupts()` se charge déjà de la copie atomique de `s_snapshot`).
+- Aucun changement de `I2C_TXRX_BUFFER_SIZE` n'a été nécessaire : la
+  trame `kPmbusResult` post-PEC (32 octets) reste pile dans le tampon
+  matériel de 32 octets.
+
+---
+
+## 8. Références fichiers
 
 | Sujet                                  | Fichier                                                          |
 |----------------------------------------|------------------------------------------------------------------|

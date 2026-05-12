@@ -25,6 +25,15 @@ constexpr uint8_t kMaxBusErrorsInARow = 5U;
 
 constexpr uint32_t kFaultLatchThreshold = 5U;  /* trips before latch */
 constexpr uint32_t kBlackBoxRefreshPeriodMs = 10000UL;
+
+/** [REQ-PWR-050] Minimum interval between two reattach attempts on a
+ *  rail that is currently `kAbsent`.  Picked as a compromise between
+ *  rapid hot-swap detection and not pounding the PMBus when a rail is
+ *  permanently disconnected.  5 s of background probing is well below
+ *  the operator-visible "rail came back" expectation (~10 s) and well
+ *  above the per-tick cadence so the reattach probe never dominates
+ *  the foreground loop.                                                */
+constexpr uint32_t kRailReattachInterval_ms = 5000UL;
 /* The LM5066H1 only retries after TIMER discharges below about 0.3 V.
  * Do not keep power-cycling it quickly, or the STM32 can prevent TIMER from
  * ever reaching the restart threshold.                                      */
@@ -59,6 +68,8 @@ Controller::Controller(const RailConfig& cfg)
       present_(false),
       fault_count_(0U),
       last_tick_ms_(0U),
+      last_reattach_ms_(0U),
+      bus_error_streak_(0U),
       accum_3min_ms_(0U),
       accum_1min_ms_(0U),
       last_vin_v_(0.0),
@@ -102,6 +113,8 @@ Controller::Controller(const RailConfig& cfg, LM5066H1Bus& bus)
       present_(false),
       fault_count_(0U),
       last_tick_ms_(0U),
+      last_reattach_ms_(0U),
+      bus_error_streak_(0U),
       accum_3min_ms_(0U),
       accum_1min_ms_(0U),
       last_vin_v_(0.0),
@@ -168,6 +181,13 @@ Status Controller::init() {
     state_ = State::kTripped;
     return s;
   }
+
+  /* [REQ-PWR-040] One-shot NVM checksum self-repair.  Must run AFTER
+   * configureDevice() so STORE_USER_ALL captures our final register set,
+   * not the silicon defaults.  The repair is idempotent across resets:
+   * once the NVM checksum is valid the chip stops asserting memoryFault
+   * and this call becomes a no-op on every subsequent boot.              */
+  (void)repairNvmIfNeeded();
 
   state_        = State::kReady;
   last_tick_ms_ = millis();
@@ -378,6 +398,148 @@ Status Controller::configureDevice() {
   return Status::kOk;
 }
 
+Status Controller::repairNvmIfNeeded() {
+  if (!present_) {
+    return Status::kOk;
+  }
+
+  /* Read STATUS_CML.  If the read itself fails we cannot tell whether
+   * memoryFault is set; bail without touching NVM.                         */
+  LM5066H1::StatusCmlBits scml = {};
+  if (!device_.readStatusCml(scml)) {
+    Serial.print(F("[NVM "));
+    Serial.print(railToString(cfg_.id));
+    Serial.println(F("] STATUS_CML read failed - repair skipped"));
+    return Status::kBusError;
+  }
+  if (!scml.memoryFault) {
+    /* Already clean.  Either this chip never had the factory NVM issue, or
+     * a previous boot's repair succeeded.  Either way, do NOT write NVM.  */
+    return Status::kOk;
+  }
+
+  Serial.print(F("[NVM "));
+  Serial.print(railToString(cfg_.id));
+  Serial.println(F("] STATUS_CML.memoryFault set; committing current "
+      "register set to user-default NVM via STORE_USER_ALL..."));
+
+  /* configureDevice() left WRITE_PROTECT = 0x00; the LM5066H1 NVM is
+   * write-enabled.  Issuing STORE_USER_ALL freezes the live register state
+   * into the chip's user-default NVM slot, which the chip subsequently
+   * checksums and restores on every power-up.                              */
+  if (!device_.storeUserAll()) {
+    Serial.print(F("[NVM "));
+    Serial.print(railToString(cfg_.id));
+    Serial.println(F("] STORE_USER_ALL NACKed - repair aborted"));
+    return Status::kBusError;
+  }
+
+  /* tNVMprog is ~200 ms per LM5066H1 datasheet (sec 7.5, "STORE_USER_ALL").
+   * Use 300 ms of headroom.  We are still well inside the IWDG window
+   * (cfg::kIwdgTimeout_ms = 4000 ms) since init() runs phase-by-phase
+   * with iwdg::kick() between phases.                                      */
+  delay(300UL);
+
+  /* Clear the latched memoryFault bit so the THIS-boot telemetry comes up
+   * clean.  Without this, the bit would persist until the next reset even
+   * though the NVM checksum has been repaired.                             */
+  (void)device_.clearFaults();
+  delay(5UL);
+
+  /* Verify: re-read STATUS_CML and confirm memoryFault is now 0.            */
+  LM5066H1::StatusCmlBits scml_after = {};
+  if (!device_.readStatusCml(scml_after)) {
+    Serial.print(F("[NVM "));
+    Serial.print(railToString(cfg_.id));
+    Serial.println(F("] post-repair STATUS_CML read failed"));
+    return Status::kBusError;
+  }
+  if (scml_after.memoryFault) {
+    /* Permanent NVM damage.  Surface loudly; the chip-side gate naturally
+     * limits us to one more attempt per boot, but a user should look at
+     * the board if they see this line on consecutive resets.                */
+    Serial.print(F("[NVM "));
+    Serial.print(railToString(cfg_.id));
+    Serial.println(F("] memoryFault STILL SET after STORE_USER_ALL - "
+        "LM5066H1 NVM appears permanently damaged.  Operationally benign "
+        "(chip falls back to defaults + firmware config) but indicates "
+        "hardware degradation.  No further NVM writes will be issued "
+        "this boot."));
+    return Status::kBusError;
+  }
+
+  Serial.print(F("[NVM "));
+  Serial.print(railToString(cfg_.id));
+  Serial.println(F("] repair successful - memoryFault cleared, NVM "
+      "checksum is now valid.  Subsequent power cycles will boot clean."));
+  return Status::kOk;
+}
+
+Status Controller::reattachIfDue() {
+  /* [REQ-PWR-050] Caller MUST only invoke this when state_ == kAbsent. */
+  const uint32_t now = millis();
+  if ((last_reattach_ms_ != 0U) &&
+      ((now - last_reattach_ms_) < kRailReattachInterval_ms)) {
+    return Status::kOk;
+  }
+  last_reattach_ms_ = now;
+
+  /* Probe the PMBus.  beginAttached() does an address ACK check; if the
+   * device does not respond we leave state alone and the next tick will
+   * try again after the interval.                                       */
+  if (!device_.beginAttached(cfg_.smbus_clock_hz)) {
+    return Status::kNotPresent;
+  }
+
+  Serial.print(F("[RAIL "));
+  Serial.print(railToString(cfg_.id));
+  Serial.println(F("] PMBus ACK observed on absent rail - "
+      "running configureDevice() to bring it back online..."));
+
+  /* Re-program the device.  This is the same call init() makes on cold
+   * boot, so a freshly-plugged LM5066H1 lands with the same VCL, OCB,
+   * CB ratio, VIN UV/OV, retry, delay-config, and watchdog settings as
+   * a cold-boot rail.                                                   */
+  const Status s = configureDevice();
+  if (s != Status::kOk) {
+    /* Configuration failed - stay absent and let the next interval retry. */
+    Serial.print(F("[RAIL "));
+    Serial.print(railToString(cfg_.id));
+    Serial.println(F("] reattach configureDevice() failed - "
+        "will retry next interval"));
+    present_ = false;
+    state_   = State::kAbsent;
+    return s;
+  }
+
+  /* If this is one of the parts shipped with a bad NVM checksum, repair
+   * it on the fly.  The function is a no-op when the bit is already
+   * clear, so it is safe to call on every reattach.                      */
+  (void)repairNvmIfNeeded();
+
+  /* Bring the rail back to kReady.  Reset all the accounting that was
+   * frozen while it was absent so the protection logic starts clean.     */
+  present_           = true;
+  state_             = State::kReady;
+  bus_error_streak_  = 0U;
+  fault_count_       = 0U;
+  accum_3min_ms_     = 0U;
+  accum_1min_ms_     = 0U;
+  last_tick_ms_      = now;
+  peak_valid_        = false;
+  desired_on_        = false;        /* require RG to re-arm OUTPUT       */
+  pending_on_recovery_ = false;
+  post_on_observe_     = false;
+  (void)refreshBlackBoxMemory();
+
+  Serial.print(F("[RAIL "));
+  Serial.print(railToString(cfg_.id));
+  Serial.println(F("] reattach successful - rail is back online "
+      "(state=kReady, OUTPUT off; host must re-issue kSetRailEnable to "
+      "turn it on)"));
+  return Status::kOk;
+}
+
 Status Controller::enable() {
   if (state_ == State::kAbsent || state_ == State::kLatched) {
     return Status::kFault;
@@ -565,7 +727,14 @@ bool Controller::ntcCelsiusFromVaux(double vaux_v, double& celsius) const {
 }
 
 void Controller::tick() {
-  if (state_ == State::kAbsent || state_ == State::kBoot) {
+  if (state_ == State::kBoot) {
+    return;
+  }
+  /* [REQ-PWR-050] Periodic re-probe for a previously-absent rail.  Bail
+   * out after the attempt so the rest of the tick (which assumes a live
+   * PMBus link) does not run against a still-disconnected device.       */
+  if (state_ == State::kAbsent) {
+    (void)reattachIfDue();
     return;
   }
 
@@ -637,17 +806,28 @@ void Controller::tick() {
   }
 
   if (!(ok_iin && ok_sw)) {
-    /* Critical reads failed - count and bail.  Bus may be glitching.        */
-    static uint8_t bus_error_streak[kRailCount] = {0U, 0U, 0U};
-    const uint8_t  rail_idx = static_cast<uint8_t>(cfg_.id);
-    if (rail_idx < kRailCount) {
-      if (++bus_error_streak[rail_idx] >= kMaxBusErrorsInARow) {
-        present_ = false;
-        state_   = State::kAbsent;
-      }
+    /* Critical reads failed - count and bail.  Bus may be glitching.
+     * [REQ-PWR-050] Counter is a member (not a function-local static)
+     * so the reattach path can reset it cleanly on bring-back.         */
+    if (++bus_error_streak_ >= kMaxBusErrorsInARow) {
+      Serial.print(F("[RAIL "));
+      Serial.print(railToString(cfg_.id));
+      Serial.print(F("] "));
+      Serial.print(kMaxBusErrorsInARow);
+      Serial.println(F(" consecutive PMBus errors - marking absent, "
+          "reattach probe will retry every 5s"));
+      present_         = false;
+      state_           = State::kAbsent;
+      last_reattach_ms_ = 0U;       /* probe again on the very next tick */
     }
     return;
   }
+
+  /* [REQ-PWR-050] Successful read pair: clear the streak so transient
+   * glitches accumulated over time cannot accidentally trip the rail
+   * to kAbsent.  This fixes a latent bug where the streak counter only
+   * ever incremented over the life of the program.                    */
+  bus_error_streak_ = 0U;
 
   /* ------------------------------------------------------------------ */
   /*  State mirroring + desired-ON recovery.                              */

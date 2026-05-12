@@ -136,6 +136,44 @@ class Controller {
   /** Helper: program every fault / warn limit register on the device.       */
   Status configureDevice();
 
+  /** [REQ-PWR-040] LM5066H1 NVM checksum self-repair.
+   *  Some LM5066H1 parts ship with an invalid on-chip NVM checksum, which
+   *  the chip surfaces as STATUS_CML bit 4 (`memoryFault`) every power-up.
+   *  The chip falls back to TI silicon defaults and accepts our
+   *  configureDevice() programming on top, so the rail still operates
+   *  correctly - but the latched bit produces a misleading `[LATCH]` line
+   *  in the FAULTS table on every boot.
+   *
+   *  This routine, called once after configureDevice() succeeds, checks
+   *  the bit and (if set) issues a single PMBus `STORE_USER_ALL` (0x15) to
+   *  commit the firmware-programmed register set to the chip's user-default
+   *  NVM slot.  The chip recomputes the NVM checksum during the program
+   *  cycle (~200 ms) and clears `memoryFault` once the checksum is valid.
+   *
+   *  The chip itself acts as the cross-boot gate: on the next reset the
+   *  `memoryFault` bit will read 0, this routine will return early, and
+   *  no further NVM writes will be issued.  In the (extraordinary) case of
+   *  permanent NVM damage the bit stays set and we log a loud warning;
+   *  one further write attempt per boot is the worst case, well inside
+   *  the LM5066H1's documented NVM endurance.                              */
+  Status repairNvmIfNeeded();
+
+  /** [REQ-PWR-050] Runtime reattach for a previously-absent LM5066H1.
+   *  Called once per `tick()` when `state_ == kAbsent`.  Rate-limits the
+   *  PMBus re-probe to one attempt every `kRailReattachInterval_ms` so a
+   *  permanently-disconnected rail does not flood the I2C bus.  On a
+   *  successful ACK the routine re-runs `configureDevice()` and (if
+   *  needed) `repairNvmIfNeeded()`, then transitions the rail back to
+   *  `kReady`.  Used to recover from:
+   *    - hot-swappable backplanes where a rail PCB is replaced at runtime,
+   *    - VIN brownouts that crash the LM5066H1's PMBus interface,
+   *    - long stretches of bus glitches that tripped the
+   *      `kMaxBusErrorsInARow` heuristic.
+   *  Returns kOk if the rail is alive (either still absent or freshly
+   *  reattached), kBusError on PMBus errors that prevented either probe
+   *  or re-config.                                                       */
+  Status reattachIfDue();
+
   /** Helper: convert a measured VAUX voltage into MOSFET NTC temperature.   */
   bool   ntcCelsiusFromVaux(double vaux_v, double& celsius) const;
 
@@ -151,6 +189,13 @@ class Controller {
   bool              present_;
   uint32_t          fault_count_;
   uint32_t          last_tick_ms_;
+
+  /* [REQ-PWR-050] Runtime reattach state.  `last_reattach_ms_` rate-limits
+   * re-probe attempts; `bus_error_streak_` is bumped on every failed I2C
+   * read pair and reset on every successful pair (replacing the static-
+   * local that previously never decremented).                            */
+  uint32_t last_reattach_ms_;
+  uint8_t  bus_error_streak_;
 
   /* Time-windowed accumulators (48 V only, idle on other rails).            */
   uint32_t accum_3min_ms_;

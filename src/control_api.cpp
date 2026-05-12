@@ -35,26 +35,57 @@ namespace control_api {
 
 namespace {
 
+/* [REQ-API-040] Protocol minor 1.10 introduces SMBus-compliant Packet Error
+ * Checking (PEC) on every fixed-size frame.  The PEC is a single trailing
+ * byte appended after the last data byte of each struct (both directions),
+ * computed as CRC8 over:
+ *
+ *   - WRITE frames (kCommand, kPmbusBridge):
+ *       crc8([(addr<<1)|0, reg, data...])
+ *   - READ  frames (kInfo, kCommandStatus, kPmbusResult):
+ *       crc8([(addr<<1)|0, reg, (addr<<1)|1, data...])
+ *
+ *   Polynomial : 0x07 (x^8 + x^2 + x + 1), seed = 0x00.
+ *
+ * The bulk-telemetry register (kTelemetryAll, 944 B) intentionally does NOT
+ * carry a PEC byte: the stm32duino slave-side hardware TX buffer caps at
+ * I2C_TXRX_BUFFER_SIZE bytes (see platformio.ini), so the master cannot
+ * clock out the trailing CRC of a 944-byte payload in a single transaction
+ * regardless.  Telemetry frames are still authenticated by the 4-byte
+ * "TLM1" magic at offset 0; any meaningful corruption is caught by the
+ * surrounding fields the master parses (e.g. uptime_ms monotonicity).
+ *
+ * Backwards-incompat note: bumping the minor from 1.9 to 1.10 is a
+ * BREAKING change for the master.  RoboGuard pdu_i2c_api.{h,cpp} must be
+ * updated to (a) read one extra byte after each fixed-size response and
+ * verify the PEC, and (b) append one extra byte to each fixed-size write
+ * computed as crc8([addr_w, reg, payload...]).                            */
 constexpr uint8_t kProtocolMajor = 1U;
-constexpr uint8_t kProtocolMinor = 9U;
+constexpr uint8_t kProtocolMinor = 10U;
 constexpr uint8_t kMaxBridgeData = 24U;
 constexpr uint8_t kRailAll       = 3U;
 constexpr uint8_t kFaultHistoryRecords = 24U;
 constexpr uint8_t kBlackBoxBytes = static_cast<uint8_t>(kLm5066BlackBoxBytes);
 
+constexpr uint8_t kApiFeaturePec = 0x01U;  /* bit0 in ApiInfo.features  */
+
 TwoWire s_api_wire(cfg::kPin_API_I2C2_SDA, cfg::kPin_API_I2C2_SCL);
 
 struct ApiInfo {
-  uint8_t magic[4];
-  uint8_t protocol_major;
-  uint8_t protocol_minor;
-  uint8_t fw_major;
-  uint8_t fw_minor;
-  uint8_t fw_patch;
-  uint8_t i2c_addr;
-  uint8_t rail_count;
-  uint8_t reserved[5];
+  uint8_t  magic[4];           /* "PDU1"                                   */
+  uint8_t  protocol_major;
+  uint8_t  protocol_minor;
+  uint8_t  fw_major;
+  uint8_t  fw_minor;
+  uint8_t  fw_patch;
+  uint8_t  i2c_addr;
+  uint8_t  rail_count;
+  uint8_t  features;           /* [REQ-API-040] bit0=PEC; bits1..7 reserved */
+  uint16_t pec_rx_errors;      /* [REQ-API-040] saturating CRC-fail counter */
+  uint8_t  reserved[2];
+  uint8_t  crc8;               /* [REQ-API-040] SMBus PEC (read direction)  */
 } __attribute__((packed));
+static_assert(sizeof(ApiInfo) == 17U, "ApiInfo layout drift");
 
 struct ApiRailTelemetry {
   uint8_t  rail_id;
@@ -161,7 +192,9 @@ struct ApiCommandFrame {
   uint8_t arg1;
   uint8_t arg2;
   uint8_t arg3;
+  uint8_t crc8;       /* [REQ-API-040] PEC over [W-addr, kCommand, fields] */
 } __attribute__((packed));
+static_assert(sizeof(ApiCommandFrame) == 6U, "ApiCommandFrame layout drift");
 
 struct ApiCommandResult {
   uint8_t sequence;
@@ -171,7 +204,10 @@ struct ApiCommandResult {
   uint8_t arg0;
   uint8_t arg1;
   uint8_t reserved[2];
+  uint8_t crc8;       /* [REQ-API-040] PEC over [W-addr, kCommandStatus,
+                       *                          R-addr, fields]          */
 } __attribute__((packed));
+static_assert(sizeof(ApiCommandResult) == 9U, "ApiCommandResult layout drift");
 
 struct ApiPmbusBridgeRequest {
   uint8_t rail_id;
@@ -179,7 +215,10 @@ struct ApiPmbusBridgeRequest {
   uint8_t command;
   uint8_t length;
   uint8_t data[kMaxBridgeData];
+  uint8_t crc8;       /* [REQ-API-040] PEC over [W-addr, kPmbusBridge, fields] */
 } __attribute__((packed));
+static_assert(sizeof(ApiPmbusBridgeRequest) == 29U,
+              "ApiPmbusBridgeRequest layout drift");
 
 struct ApiPmbusBridgeResult {
   uint8_t sequence;
@@ -190,7 +229,14 @@ struct ApiPmbusBridgeResult {
   uint8_t command;
   uint8_t length;
   uint8_t data[kMaxBridgeData];
+  uint8_t crc8;       /* [REQ-API-040] PEC over [W-addr, kPmbusResult,
+                       *                          R-addr, fields]          */
 } __attribute__((packed));
+/* Pre-PEC layout was 31 bytes; with the trailing CRC8 byte the struct now
+ * lands exactly on the 32-byte stm32duino I2C TX buffer boundary, so no
+ * `-DI2C_TXRX_BUFFER_SIZE` bump is required.                              */
+static_assert(sizeof(ApiPmbusBridgeResult) == 32U,
+              "ApiPmbusBridgeResult layout drift");
 
 ApiInfo s_info = {
     {'P', 'D', 'U', '1'},
@@ -201,7 +247,10 @@ ApiInfo s_info = {
     cfg::kFwVersionPatch,
     cfg::kApiI2cAddress,
     3U,
-    {0U, 0U, 0U, 0U, 0U},
+    kApiFeaturePec,        /* features                                     */
+    0U,                    /* pec_rx_errors (recomputed before each TX)    */
+    {0U, 0U},              /* reserved                                     */
+    0U,                    /* crc8 (stamped in init(), refreshed in TX ISR)*/
 };
 
 ApiTelemetryAll    s_snapshot = {};
@@ -224,6 +273,105 @@ bool             s_initialised     = false;
 volatile uint32_t s_dbg_rx_count = 0U;
 volatile uint32_t s_dbg_tx_count = 0U;
 // #endregion
+
+/* [REQ-API-040] Saturating counter of frames the slave rejected because
+ * the master-supplied trailing CRC8 byte did not match the expected
+ * SMBus PEC.  Incremented from the I2C2 RX ISR (onReceive) when a write
+ * to kCommand or kPmbusBridge is dropped.  Surfaced to the master in
+ * ApiInfo.pec_rx_errors so RG can flag a flaky bus without needing SWO.  */
+volatile uint16_t s_pec_rx_errors = 0U;
+
+/* ---------------------------------------------------------------------------
+ *  CRC8 / SMBus PEC primitives.
+ *
+ *  SMBus 2.0 / PMBus 1.x Packet Error Code: CRC8 with polynomial 0x07
+ *  (x^8 + x^2 + x + 1), seed = 0x00, no input/output reflection, no final
+ *  XOR.  This is the same byte-level construction used by the LM5066H1
+ *  hot-swap controllers on I2C1, so the routines below are reusable should
+ *  the LM5066H1 driver later opt into PEC mode itself.
+ *
+ *  The helpers are deliberately scalar / unrolled-free: one CRC8 byte costs
+ *  ~50 cycles (~0.7 us at 72 MHz) so even a 944-byte payload would only
+ *  burn ~660 us, well under the 5 ms IWDG window.  In practice the largest
+ *  PEC-protected frame is sizeof(ApiPmbusBridgeResult)=33 bytes (~24 us).
+ *
+ *  Inlined into the anonymous namespace so the linker can fold them away
+ *  in -Os builds where only a subset of helpers is reachable.
+ * ---------------------------------------------------------------------------*/
+static inline uint8_t crc8Update(uint8_t crc, uint8_t byte) {
+  crc ^= byte;
+  for (uint8_t b = 0U; b < 8U; ++b) {
+    crc = ((crc & 0x80U) != 0U)
+              ? static_cast<uint8_t>((static_cast<uint16_t>(crc) << 1U) ^ 0x07U)
+              : static_cast<uint8_t>(static_cast<uint16_t>(crc) << 1U);
+  }
+  return crc;
+}
+
+static uint8_t crc8Buffer(uint8_t seed, const uint8_t* data, size_t len) {
+  uint8_t crc = seed;
+  for (size_t i = 0U; i < len; ++i) {
+    crc = crc8Update(crc, data[i]);
+  }
+  return crc;
+}
+
+/* PEC seed for a master->slave WRITE: addr_w, reg.                       */
+static uint8_t pecSeedWrite(uint8_t reg) {
+  const uint8_t addr_w =
+      static_cast<uint8_t>(static_cast<uint16_t>(cfg::kApiI2cAddress) << 1U);
+  uint8_t crc = crc8Update(0U, addr_w);
+  crc = crc8Update(crc, reg);
+  return crc;
+}
+
+/* PEC seed for a slave->master READ: addr_w, reg, addr_r.                */
+static uint8_t pecSeedRead(uint8_t reg) {
+  const uint8_t addr_w =
+      static_cast<uint8_t>(static_cast<uint16_t>(cfg::kApiI2cAddress) << 1U);
+  const uint8_t addr_r = static_cast<uint8_t>(addr_w | 0x01U);
+  uint8_t crc = crc8Update(0U, addr_w);
+  crc = crc8Update(crc, reg);
+  crc = crc8Update(crc, addr_r);
+  return crc;
+}
+
+/* Stamp `s.crc8` so the response struct carries a valid SMBus PEC.
+ * Pre-condition: the `crc8` member must be the LAST byte of T (enforced
+ * by the static_asserts on each struct above).                            */
+template <typename T>
+static void stampReadPec(T& s, uint8_t reg) {
+  const uint8_t seed = pecSeedRead(reg);
+  s.crc8 = crc8Buffer(seed, reinterpret_cast<const uint8_t*>(&s),
+                      sizeof(T) - 1U);
+}
+
+/* Verify a master-supplied PEC byte on a WRITE frame.                     */
+template <typename T>
+static bool verifyWritePec(const T& s, uint8_t reg) {
+  const uint8_t seed = pecSeedWrite(reg);
+  const uint8_t expect = crc8Buffer(seed,
+                                    reinterpret_cast<const uint8_t*>(&s),
+                                    sizeof(T) - 1U);
+  return expect == s.crc8;
+}
+
+/* Saturating ++ on the PEC error counter.  Called from ISR context.       */
+static inline void bumpPecRxErrors() {
+  const uint16_t v = s_pec_rx_errors;
+  if (v < 0xFFFFU) {
+    s_pec_rx_errors = static_cast<uint16_t>(v + 1U);
+  }
+}
+
+/* [REQ-API-030] Silence-detector state.  Hoisted to file scope so the
+ * recovery path at the bottom of rearmListenIfStuck() can reset it after
+ * a successful SWRST + Init, preventing the same silence window from
+ * re-triggering recovery every 2 s (the rate-limit interval).            */
+uint32_t s_silence_last_rx        = 0U;
+uint32_t s_silence_last_tx        = 0U;
+uint32_t s_silence_last_change_ms = 0U;
+bool     s_silence_warn_fired     = false;
 
 void printHex2(uint8_t value) {
   if (value < 0x10U) {
@@ -651,6 +799,12 @@ void processCommand(rail::Controller& r48,
       s_command_result.busy = 0U;
       s_command_result.status = static_cast<uint8_t>(Status::kOk);
       s_command_result.command = cmd.command;
+      /* [REQ-API-040] Stamp PEC here too: the recordAndReset() call below
+       * reboots the MCU, so the result struct must already be PEC-valid
+       * if the master happens to poll kCommandStatus before the reset
+       * actually trips (NVIC reset has a few microseconds of latency).    */
+      stampReadPec(s_command_result,
+                   static_cast<uint8_t>(Register::kCommandStatus));
       fault_log::recordAndReset(fault_log::Code::kHostRequestedReset,
                                 Rail::kCount,
                                 0U,
@@ -713,6 +867,9 @@ void processCommand(rail::Controller& r48,
   result.command = cmd.command;
   result.arg0 = cmd.arg0;
   result.arg1 = cmd.arg1;
+  /* [REQ-API-040] Stamp the read-direction SMBus PEC over the populated
+   * fields; this is what the master will verify when it pulls kCommandStatus. */
+  stampReadPec(result, static_cast<uint8_t>(Register::kCommandStatus));
   noInterrupts();
   s_command_result = result;
   interrupts();
@@ -769,6 +926,8 @@ void processBridge(rail::Controller& r48,
   }
 
   result.status = static_cast<uint8_t>(rc);
+  /* [REQ-API-040] Read-direction PEC for the kPmbusResult response.       */
+  stampReadPec(result, static_cast<uint8_t>(Register::kPmbusResult));
   noInterrupts();
   s_bridge_result = result;
   interrupts();
@@ -806,8 +965,17 @@ void onReceive(int count) {
     while (s_api_wire.available() && i < max_len) {
       dst[i++] = static_cast<uint8_t>(s_api_wire.read());
     }
-    s_pending_command = cmd;
-    s_command_pending = true;
+    /* [REQ-API-040] Reject any frame that is short (master forgot the PEC
+     * byte or the transfer was truncated) or whose trailing CRC8 does not
+     * match the expected SMBus PEC.  The frame is dropped silently; the
+     * master will see no advance of s_command_result.sequence and one
+     * extra count in ApiInfo.pec_rx_errors on its next /info poll.        */
+    if (i != sizeof(cmd) || !verifyWritePec(cmd, static_cast<uint8_t>(reg))) {
+      bumpPecRxErrors();
+    } else {
+      s_pending_command = cmd;
+      s_command_pending = true;
+    }
 #if defined(PDU_API_DEBUG_ONLY)
     queueApiDebug(ApiDebugKind::kRxCommand, static_cast<uint8_t>(reg),
                   static_cast<uint8_t>(i), cmd.command, cmd.arg0, cmd.arg1);
@@ -820,11 +988,16 @@ void onReceive(int count) {
     while (s_api_wire.available() && i < max_len) {
       dst[i++] = static_cast<uint8_t>(s_api_wire.read());
     }
-    if (req.length > kMaxBridgeData) {
-      req.length = kMaxBridgeData;
+    /* [REQ-API-040] PEC validation, identical pattern to kCommand above. */
+    if (i != sizeof(req) || !verifyWritePec(req, static_cast<uint8_t>(reg))) {
+      bumpPecRxErrors();
+    } else {
+      if (req.length > kMaxBridgeData) {
+        req.length = kMaxBridgeData;
+      }
+      s_pending_bridge = req;
+      s_bridge_pending = true;
     }
-    s_pending_bridge = req;
-    s_bridge_pending = true;
 #if defined(PDU_API_DEBUG_ONLY)
     queueApiDebug(ApiDebugKind::kRxBridge, static_cast<uint8_t>(reg),
                   static_cast<uint8_t>(i), req.rail_id, req.op, req.command);
@@ -844,6 +1017,17 @@ void onRequest() {
   // #region agent log
   ++s_dbg_tx_count;
   // #endregion
+
+  /* [REQ-API-040] Refresh the live PEC-rx error count and re-stamp the
+   * ApiInfo CRC8 byte just before sending.  The work is bounded (one
+   * 16-byte CRC8 = ~50 cycles, < 1 us at 72 MHz) so this stays well
+   * inside the time the master expects between ACK and first data byte.
+   * Done here rather than in the foreground tick so the master always
+   * sees the most recent error counter regardless of how the call
+   * interleaves with s_pec_rx_errors increments from onReceive().        */
+  s_info.pec_rx_errors = s_pec_rx_errors;
+  stampReadPec(s_info, static_cast<uint8_t>(Register::kInfo));
+
   const uint8_t reg = s_read_register;
 #if defined(PDU_API_DEBUG_ONLY)
   queueApiDebug(ApiDebugKind::kTx, reg, 0U, responseLengthForRegister(reg),
@@ -901,12 +1085,23 @@ Status init() {
   (void)HAL_I2C_EnableListen_IT(s_api_wire.getHandle());
   s_api_wire.onReceive(onReceive);
   s_api_wire.onRequest(onRequest);
+
+  /* [REQ-API-040] Stamp a valid PEC on s_info before the very first
+   * /info read can land.  onRequest() refreshes it on every TX, but this
+   * covers the race where a fast master polls before any onRequest has
+   * fired (e.g. before s_initialised was true).                           */
+  stampReadPec(s_info, static_cast<uint8_t>(Register::kInfo));
+
   s_initialised = true;
   Serial.print(F("[API INIT] I2C2 slave addr=0x"));
   printHex2(cfg::kApiI2cAddress);
   Serial.print(F(" clock="));
   Serial.print(cfg::kApiI2cClock_Hz);
-  Serial.println(F("Hz pins SCL=PB10 SDA=PB11"));
+  Serial.print(F("Hz pins SCL=PB10 SDA=PB11 proto="));
+  Serial.print(kProtocolMajor);
+  Serial.print('.');
+  Serial.print(kProtocolMinor);
+  Serial.println(F(" PEC=on"));
   return Status::kOk;
 }
 
@@ -1030,36 +1225,42 @@ static void rearmListenIfStuck() {
   }
   const uint32_t silent_ms = now_ms_p - s_last_progress_ms;
 
-  // #region agent log
-  /* Two-tier diagnostic:
-   *   1) Coarse heartbeat once per second (proves we got into rearm tick
-   *      and dumps the peripheral snapshot).
-   *   2) Silence detector: if rx_count AND tx_count have not advanced for
-   *      >3 s while the peripheral state looks "healthy" (PE=ACK=1,
-   *      LISTEN), fire ONCE so we capture the exact moment RG stops
-   *      seeing transactions.  This is the symptom the user describes
-   *      ("I2C RG at some random point stops communicating") and is
-   *      currently not caught by the regular rearmListenIfStuck logic
-   *      because all the visible flags still look correct.               */
+  /* [REQ-API-030] Silence-based recovery.
+   *
+   * Two-tier signal extracted from the application-level rx#/tx# counters:
+   *   1) Warning at kSilentWarnMs of frozen counters: dumps the peripheral
+   *      snapshot once per silence window so the next active master byte
+   *      lets us see the before/after state.
+   *   2) Forced recovery at kSilentForceRecoveryMs of frozen counters,
+   *      EVEN IF the peripheral state appears healthy (PE=ACK=1, LISTEN).
+   *      Without this, the previous logic would only recover from the
+   *      "stuck-in-BUSY_*_LISTEN" fingerprint - but a master that
+   *      disconnects cleanly (RG rebooting, ribbon unplugged, ...) leaves
+   *      our slave looking pristine while no transactions land.  Forcing
+   *      a SWRST + Init on long silence guarantees the slave is in a
+   *      known-good Listen state when the master comes back online. */
+  static constexpr uint32_t kSilentWarnMs           = 3000U;
+  static constexpr uint32_t kSilentForceRecoveryMs  = 10000U;
+
+  /* The silence-detector statics live at file scope (above this function)
+   * so the post-recovery block at the bottom can reset them; see the
+   * paired write at the end of this function.                            */
+  bool silence_force_recovery = false;
   {
 #if defined(PDU_VERBOSE_DEBUG)
     static uint32_t s_dbg_last_ms        = 0U;
 #endif
-    static uint32_t s_dbg_last_rx        = 0U;
-    static uint32_t s_dbg_last_tx        = 0U;
-    static uint32_t s_dbg_last_change_ms = 0U;
-    static bool     s_dbg_silence_fired  = false;
     const uint32_t now_ms = millis();
     uint32_t rx_now, tx_now;
     noInterrupts();
     rx_now = s_dbg_rx_count;
     tx_now = s_dbg_tx_count;
     interrupts();
-    if (rx_now != s_dbg_last_rx || tx_now != s_dbg_last_tx) {
-      s_dbg_last_rx        = rx_now;
-      s_dbg_last_tx        = tx_now;
-      s_dbg_last_change_ms = now_ms;
-      s_dbg_silence_fired  = false;
+    if (rx_now != s_silence_last_rx || tx_now != s_silence_last_tx) {
+      s_silence_last_rx        = rx_now;
+      s_silence_last_tx        = tx_now;
+      s_silence_last_change_ms = now_ms;
+      s_silence_warn_fired     = false;
     }
 #if defined(PDU_VERBOSE_DEBUG)
     if ((now_ms - s_dbg_last_ms) >= 1000U) {
@@ -1067,26 +1268,40 @@ static void rearmListenIfStuck() {
       dbgDumpI2c2State("tick");
     }
 #endif
-    /* Fire on ANY 3 s of frozen rx/tx counters, regardless of CR1/state.
-     * This catches both the "looks-healthy-but-deaf" case and the
-     * "stuck-in-BUSY_RX_LISTEN" case we just observed.                   */
-    if (!s_dbg_silence_fired &&
-        s_dbg_last_change_ms != 0U &&
-        (now_ms - s_dbg_last_change_ms) >= 3000U) {
-      s_dbg_silence_fired = true;
+    const uint32_t silent_for_ms =
+        (s_silence_last_change_ms != 0U)
+            ? (now_ms - s_silence_last_change_ms)
+            : 0U;
+
+    /* Tier 1: warning print, once per silence window. */
+    if (!s_silence_warn_fired &&
+        s_silence_last_change_ms != 0U &&
+        silent_for_ms >= kSilentWarnMs) {
+      s_silence_warn_fired = true;
       Serial.print(F("[I2C2 STALL] silent for "));
-      Serial.print(now_ms - s_dbg_last_change_ms);
+      Serial.print(silent_for_ms);
       Serial.print(F("ms; rx#="));
       Serial.print(rx_now);
       Serial.print(F(" tx#="));
       Serial.println(tx_now);
       dbgDumpI2c2State("stall");
     }
-  }
-  // #endregion
 
-  /* Healthy: leave alone. */
-  if (pe_set && ack_set && state_listen) {
+    /* Tier 2: force-recovery trigger.  Crossed only when the master has
+     * been completely silent for at least kSilentForceRecoveryMs, far
+     * beyond any legitimate poll gap (RG polls every ~1-3 s in normal
+     * operation).                                                       */
+    if (s_silence_last_change_ms != 0U &&
+        silent_for_ms >= kSilentForceRecoveryMs) {
+      silence_force_recovery = true;
+    }
+  }
+
+  /* Healthy: leave alone (UNLESS we've been silent long enough that the
+   * "healthy" appearance is unreliable - the master has clearly stopped
+   * talking and we need to re-arm in case the peripheral missed an event
+   * that left it deaf with PE/ACK/LISTEN bits still asserted).            */
+  if (pe_set && ack_set && state_listen && !silence_force_recovery) {
     return;
   }
 
@@ -1129,6 +1344,17 @@ static void rearmListenIfStuck() {
   /* Reset trackers on the freshly-reinitialised handle. */
   s_last_progress_ms = now_ms_p;
   s_stuck_since_ms   = 0U;
+
+  /* [REQ-API-030] Reset the silence detector so the same stalled window
+   * does not immediately re-trigger another force-recovery.  After this
+   * point the slave is back in Listen state and any subsequent master
+   * activity will advance s_dbg_rx_count / s_dbg_tx_count again.        */
+  s_silence_last_change_ms = now_ms_p;
+  s_silence_warn_fired     = false;
+  noInterrupts();
+  s_silence_last_rx = s_dbg_rx_count;
+  s_silence_last_tx = s_dbg_tx_count;
+  interrupts();
 
   // #region agent log
   dbgDumpI2c2State("post-reset");

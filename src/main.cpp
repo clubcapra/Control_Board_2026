@@ -640,6 +640,17 @@ static constexpr uint32_t kOutputTestRampMs   = 15000U;
 static constexpr uint32_t kOutputTestUpdateMs = 20U;
 static constexpr uint8_t  kOutputTestMaxPct   = 100U;
 
+/* [TEMPORARY - OUTPUT TEST ONLY] Static-hold duty cycle for the four LED
+ * channels.  When this constant is set to a value in 0..100, tickOutputTest()
+ * bypasses the 0%->100%->0% sawtooth ramp and pins every channel at that
+ * value instead.  Set back to 0xFFU to re-enable the ramp.
+ *
+ * The PWM carrier frequency (`cfg::kLedPwmFrequency_Hz` = 2 kHz) is owned
+ * by the LED module - any value below `cfg::kLedKickThreshold_pct` (40 %)
+ * automatically triggers the [REQ-LED-004] cold-start kick to 40 % for
+ * 50 ms before settling at this duty.  No extra kick logic is needed here. */
+static constexpr uint8_t  kOutputTestStaticPct = 3U;
+
 static uint32_t s_output_test_start_ms = 0U;
 static uint32_t s_output_test_last_ms  = 0U;
 static uint8_t  s_output_test_last_pct = 0xFFU;
@@ -662,12 +673,23 @@ static void tickOutputTest(uint32_t now) {
   }
   s_output_test_last_ms = now;
 
-  const uint32_t cycle_ms = kOutputTestRampMs * 2U;
-  const uint32_t phase_ms = (now - s_output_test_start_ms) % cycle_ms;
-  const uint32_t ramp_ms =
-      (phase_ms <= kOutputTestRampMs) ? phase_ms : (cycle_ms - phase_ms);
-  const uint8_t duty_pct =
-      static_cast<uint8_t>((ramp_ms * kOutputTestMaxPct) / kOutputTestRampMs);
+  uint8_t duty_pct;
+  if (kOutputTestStaticPct <= 100U) {
+    /* [TEMPORARY] Static-hold mode: keep the ramp state variables live so
+     * a single edit of `kOutputTestStaticPct` back to 0xFFU is the only
+     * change needed to revert to the original sawtooth ramp.              */
+    (void)s_output_test_start_ms;
+    (void)kOutputTestRampMs;
+    (void)kOutputTestMaxPct;
+    duty_pct = kOutputTestStaticPct;
+  } else {
+    const uint32_t cycle_ms = kOutputTestRampMs * 2U;
+    const uint32_t phase_ms = (now - s_output_test_start_ms) % cycle_ms;
+    const uint32_t ramp_ms =
+        (phase_ms <= kOutputTestRampMs) ? phase_ms : (cycle_ms - phase_ms);
+    duty_pct = static_cast<uint8_t>(
+        (ramp_ms * kOutputTestMaxPct) / kOutputTestRampMs);
+  }
 
   if (duty_pct != s_output_test_last_pct) {
     s_output_test_last_pct = duty_pct;
@@ -679,7 +701,15 @@ static void tickOutputTest(uint32_t now) {
 }
 
 static void initOutputTest() {
-  Serial.println(F("[OUTPUT TEST] All 4 LEDs simultaneously: 0%->100% in 15s, then 100%->0% in 15s"));
+  if (kOutputTestStaticPct <= 100U) {
+    Serial.print(F("[OUTPUT TEST] *** TEMPORARY *** All 4 LEDs held STATIC at "));
+    Serial.print(kOutputTestStaticPct);
+    Serial.print(F("% @ "));
+    Serial.print(cfg::kLedPwmFrequency_Hz);
+    Serial.println(F("Hz (ramp disabled)"));
+  } else {
+    Serial.println(F("[OUTPUT TEST] All 4 LEDs simultaneously: 0%->100% in 15s, then 100%->0% in 15s"));
+  }
   (void)winch::sleep();
   (void)winch_lock::setAll(false);
   armOutputTestPwmChannels();
