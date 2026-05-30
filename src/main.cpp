@@ -617,22 +617,26 @@ static void disableAllRails() {
   }
 }
 
-/** [REQ-PWR-100] Energise every present rail using the documented
+/** [REQ-PWR-100] Reset + energise every present rail using the documented
  *  power-up sequence: 12V, then 24V, then 48V.  Each step is separated by
  *  cfg::kRailEnableSequenceGap so the next rail sees a stable bus before
- *  its inrush.  When `kHotswapApiOnly` is true this function is a no-op
- *  by policy: the host (RG) owns the OPERATION register.                 */
+ *  its inrush.
+ *
+ *  Each rail is brought up via resetAndEnable(), which wipes every latched
+ *  LM5066H1 fault (so stale UV/OV latches from the power-up VIN ramp do not
+ *  survive the boot) and then commands OPERATION = ON.
+ *
+ *  This deliberately runs even when `kHotswapApiOnly` is true: the rails
+ *  come up energised on a cold boot without waiting for a host OPERATION
+ *  write.  Runtime ownership of OPERATION is unchanged - the host (RG) can
+ *  still disable / re-enable any rail through the I2C2 API at any time, and
+ *  tick() still never re-asserts OPERATION on its own.                     */
 static void enableAllRails() {
-  if (cfg::kHotswapApiOnly) {
-    Serial.println(F("[HOTSWAP] API-only: automatic rail enable skipped"));
-    return;
-  }
-
-  s_rail12.enable();
+  s_rail12.resetAndEnable();
   delay(kRailEnableSequenceGapMs);
-  s_rail24.enable();
+  s_rail24.resetAndEnable();
   delay(kRailEnableSequenceGapMs);
-  s_rail48.enable();
+  s_rail48.resetAndEnable();
 }
 
 #if defined(PDU_OUTPUT_TEST_ONLY)
@@ -752,14 +756,74 @@ static void emitActive(const char* rail, const __FlashStringHelper* msg,
   any = true;
 }
 
-/** Tag printed before a stale latched bit awaiting CLEAR_FAULTS. */
+/** Tag printed before a latched fault bit awaiting CLEAR_FAULTS.
+ *
+ *  `cleared` distinguishes two very different situations that the raw latch
+ *  bit cannot:
+ *    - cleared == false -> "[LATCH ]" (yellow): the bit is latched AND the
+ *      underlying condition still appears present in live telemetry right
+ *      now.  This is a real, current problem.
+ *    - cleared == true  -> "[OLD   ]" (gray): the bit is latched but the
+ *      condition is no longer present (e.g. a UV that occurred during the
+ *      power-up ramp, or a startup watchdog on a rail that is now happily
+ *      regulating).  Historical only - it will disappear on CLEAR_FAULTS.  */
 static void emitLatched(const char* rail, const __FlashStringHelper* msg,
-                        bool& any) {
-  Serial.print(F("  " ANSI_YELLOW "[LATCH ]" ANSI_RESET " "));
+                        bool& any, bool cleared) {
+  if (cleared) {
+    Serial.print(F("  " ANSI_GRAY "[OLD   ]" ANSI_RESET " "));
+  } else {
+    Serial.print(F("  " ANSI_YELLOW "[LATCH ]" ANSI_RESET " "));
+  }
   Serial.print(rail);
   Serial.print(F(": "));
   Serial.println(msg);
   any = true;
+}
+
+/** Per-rail VIN under/over-voltage envelope.  Returns 0 for an unknown rail
+ *  so callers treat the threshold as "not configured".                     */
+static void vinThresholds(Rail rail, double& uv, double& ov) {
+  switch (rail) {
+    case Rail::k48V: uv = cfg::kVin48V_UV_V; ov = cfg::kVin48V_OV_V; break;
+    case Rail::k24V: uv = cfg::kVin24V_UV_V; ov = cfg::kVin24V_OV_V; break;
+    case Rail::k12V: uv = cfg::kVin12V_UV_V; ov = cfg::kVin12V_OV_V; break;
+    case Rail::kCount:
+    default:         uv = 0.0;               ov = 0.0;               break;
+  }
+}
+
+/** True when the rail is presently energised and the chip reports the output
+ *  stage ON.  Latched protection bits (watchdog, CB, OC, FET, SCP, ...) that
+ *  have no dedicated live telemetry signal are treated as historical ("OLD")
+ *  whenever the rail is healthy now, since by definition the past trip has
+ *  since recovered.                                                         */
+static bool railHealthyNow(const RailTelemetry& tlm) {
+  const bool op_cmd_on   = (tlm.operation_raw & kPmbusOperationOnMask) != 0U;
+  const bool reports_off = bitIsSet(tlm.status_word, kStatusWordBitDeviceOff) ||
+                           bitIsSet(tlm.diag_word, 6U /* DIAG DEVICE_OFF */);
+  return tlm.present && op_cmd_on && !reports_off;
+}
+
+/** True when either temperature sensor currently reads at/above its trip
+ *  threshold.  NaN / sentinel (no-diode) readings compare false, so an
+ *  unpopulated die diode never looks like a live over-temperature.          */
+static bool overTempNow(const RailTelemetry& tlm) {
+  return (tlm.die_temp_c >= cfg::kOtFault_C) ||
+         (tlm.ntc_temp_c >= cfg::kNtcTrip_C);
+}
+
+/** True when live VIN is below the rail's UV threshold right now.           */
+static bool vinUnderVoltageNow(const RailTelemetry& tlm) {
+  double uv = 0.0, ov = 0.0;
+  vinThresholds(tlm.rail, uv, ov);
+  return (uv > 0.0) && tlm.present && (tlm.vin_v < uv);
+}
+
+/** True when live VIN is above the rail's OV threshold right now.           */
+static bool vinOverVoltageNow(const RailTelemetry& tlm) {
+  double uv = 0.0, ov = 0.0;
+  vinThresholds(tlm.rail, uv, ov);
+  return (ov > 0.0) && tlm.present && (tlm.vin_v > ov);
 }
 
 /** Live cross-checks derived from present telemetry instead of stale
@@ -777,24 +841,7 @@ static void decodeLiveConditions(const RailTelemetry& tlm,
 
   double vin_uv = 0.0;
   double vin_ov = 0.0;
-  switch (tlm.rail) {
-    case Rail::k48V:
-      vin_uv = cfg::kVin48V_UV_V;
-      vin_ov = cfg::kVin48V_OV_V;
-      break;
-    case Rail::k24V:
-      vin_uv = cfg::kVin24V_UV_V;
-      vin_ov = cfg::kVin24V_OV_V;
-      break;
-    case Rail::k12V:
-      vin_uv = cfg::kVin12V_UV_V;
-      vin_ov = cfg::kVin12V_OV_V;
-      break;
-    case Rail::kCount:
-    default:
-      /* Unreachable: rail enum is exhaustive over the three real rails. */
-      break;
-  }
+  vinThresholds(tlm.rail, vin_uv, vin_ov);
   if (tlm.present && (vin_uv > 0.0) && (tlm.vin_v < vin_uv)) {
     emitActive(rail, F("VIN is below UV threshold right now"), any);
   }
@@ -806,35 +853,45 @@ static void decodeLiveConditions(const RailTelemetry& tlm,
 /** STATUS_WORD (PMBus 0x79, 16-bit).  Only the low-byte fault bits are
  *  surfaced here; the high-byte summary bits duplicate dedicated status
  *  registers that we already decode individually.                        */
-static void decodeStatusWord(uint16_t sw, const char* rail, bool& any) {
+static void decodeStatusWord(const RailTelemetry& tlm, const char* rail,
+                             bool& any) {
+  const uint16_t sw = tlm.status_word;
+  const bool healthy = railHealthyNow(tlm);
   if (bitIsSet(sw, kStatusWordBitBusy)) {
     emitActive(rail,
         F("PMBus: device BUSY right now (unable to respond)"), any);
   }
   if (bitIsSet(sw, kStatusWordBitVoutOvFault)) {
-    emitLatched(rail, F("PMBus: VOUT overvoltage fault bit set"), any);
+    emitLatched(rail, F("PMBus: VOUT overvoltage fault bit set"), any, healthy);
   }
   if (bitIsSet(sw, kStatusWordBitIoutOcFault)) {
-    emitLatched(rail, F("PMBus: IOUT overcurrent fault bit set"), any);
+    emitLatched(rail, F("PMBus: IOUT overcurrent fault bit set"), any, healthy);
   }
   if (bitIsSet(sw, kStatusWordBitVinUvFault)) {
-    emitLatched(rail, F("PMBus: VIN undervoltage fault bit set"), any);
+    emitLatched(rail, F("PMBus: VIN undervoltage fault bit set"), any,
+                !vinUnderVoltageNow(tlm));
   }
   if (bitIsSet(sw, kStatusWordBitTempFault)) {
-    emitLatched(rail, F("PMBus: temperature fault bit set"), any);
+    emitLatched(rail, F("PMBus: temperature fault bit set"), any,
+                !overTempNow(tlm));
   }
 }
 
 /** STATUS_INPUT (PMBus 0x7C, 8-bit). */
-static void decodeStatusInput(uint8_t sin, const char* rail, bool& any) {
+static void decodeStatusInput(const RailTelemetry& tlm, const char* rail,
+                              bool& any) {
+  const uint8_t sin = tlm.status_input;
+  const bool healthy = railHealthyNow(tlm);
   if (bitIsSet(sin, kStatusInputBitVinOvFault)) {
-    emitLatched(rail, F("INPUT: VIN overvoltage fault bit set"), any);
+    emitLatched(rail, F("INPUT: VIN overvoltage fault bit set"), any,
+                !vinOverVoltageNow(tlm));
   }
   if (bitIsSet(sin, kStatusInputBitVinUvFault)) {
-    emitLatched(rail, F("INPUT: VIN undervoltage fault bit set"), any);
+    emitLatched(rail, F("INPUT: VIN undervoltage fault bit set"), any,
+                !vinUnderVoltageNow(tlm));
   }
   if (bitIsSet(sin, kStatusInputBitOcFault)) {
-    emitLatched(rail, F("INPUT: IIN overcurrent fault bit set"), any);
+    emitLatched(rail, F("INPUT: IIN overcurrent fault bit set"), any, healthy);
   }
 }
 
@@ -848,83 +905,108 @@ static void decodeStatusInput(uint8_t sin, const char* rail, bool& any) {
  *  configureDevice() programming on top.  The rail is operational; this
  *  bit is therefore reported as a benign LATCH for traceability rather
  *  than as a flight-rail fault.                                          */
-static void decodeStatusCml(uint8_t scml, const char* rail, bool& any) {
+static void decodeStatusCml(const RailTelemetry& tlm, const char* rail,
+                            bool& any) {
+  const uint8_t scml = tlm.status_cml;
+  /* A latched bus-comms glitch is historical once we are successfully
+   * exchanging bytes with the part again (which we just did to read this
+   * telemetry).  Treat the standard CML bits as OLD when the rail is up.   */
+  const bool healthy = railHealthyNow(tlm);
   if (bitIsSet(scml, kStatusCmlBitInvCmd)) {
-    emitLatched(rail, F("CML: invalid/unsupported PMBus command bit set"), any);
+    emitLatched(rail, F("CML: invalid/unsupported PMBus command bit set"),
+                any, healthy);
   }
   if (bitIsSet(scml, kStatusCmlBitInvData)) {
-    emitLatched(rail, F("CML: invalid/unsupported PMBus data bit set"), any);
+    emitLatched(rail, F("CML: invalid/unsupported PMBus data bit set"),
+                any, healthy);
   }
   if (bitIsSet(scml, kStatusCmlBitInvPec)) {
-    emitLatched(rail, F("CML: PEC failure bit set"), any);
+    emitLatched(rail, F("CML: PEC failure bit set"), any, healthy);
   }
   if (bitIsSet(scml, kStatusCmlBitMemoryFault)) {
+    /* memoryFault re-asserts every boot on a part with a bad NVM checksum
+     * and is operationally benign, so it is never marked OLD.              */
     emitLatched(rail,
         F("CML: LM5066H1 NVM checksum mismatch (chip uses defaults; "
-          "operationally benign)"), any);
+          "operationally benign)"), any, false);
   }
 }
 
 /** STATUS_MFR_SPECIFIC (PMBus 0x80, 8-bit). */
-static void decodeStatusMfr(uint8_t smfr, const char* rail, bool& any) {
+static void decodeStatusMfr(const RailTelemetry& tlm, const char* rail,
+                            bool& any) {
+  const uint8_t smfr = tlm.status_mfr_specific;
+  const bool healthy = railHealthyNow(tlm);
   if (bitIsSet(smfr, kStatusMfrBitCbFault)) {
-    emitLatched(rail, F("MFR: circuit breaker trip bit set"), any);
+    emitLatched(rail, F("MFR: circuit breaker trip bit set"), any, healthy);
   }
   if (bitIsSet(smfr, kStatusMfrBitFetFail)) {
-    emitLatched(rail, F("MFR: external MOSFET failure bit set"), any);
+    emitLatched(rail, F("MFR: external MOSFET failure bit set"), any, healthy);
   }
   if (bitIsSet(smfr, kStatusMfrBitBbRamFull)) {
     emitActive(rail, F("MFR: black-box RAM full right now"), any);
   }
   if (bitIsSet(smfr, kStatusMfrBitFetFaultGate2)) {
-    emitLatched(rail, F("MFR: FET fault on GATE2 bit set"), any);
+    emitLatched(rail, F("MFR: FET fault on GATE2 bit set"), any, healthy);
   }
   if (bitIsSet(smfr, kStatusMfrBitFetFaultGate1)) {
-    emitLatched(rail, F("MFR: FET fault on GATE1 bit set"), any);
+    emitLatched(rail, F("MFR: FET fault on GATE1 bit set"), any, healthy);
   }
   if (bitIsSet(smfr, kStatusMfrBitFetFaultDrain)) {
-    emitLatched(rail, F("MFR: FET drain sense fault bit set"), any);
+    emitLatched(rail, F("MFR: FET drain sense fault bit set"), any, healthy);
   }
 }
 
 /** STATUS_MFR_SPECIFIC_2 (PMBus 0xF3, 16-bit). */
-static void decodeStatusMfr2(uint16_t smfr2, const char* rail, bool& any) {
+static void decodeStatusMfr2(const RailTelemetry& tlm, const char* rail,
+                             bool& any) {
+  const uint16_t smfr2 = tlm.status_mfr_specific2;
+  const bool healthy = railHealthyNow(tlm);
   if (bitIsSet(smfr2, kStatusMfr2BitWatchdog)) {
-    emitLatched(rail, F("MFR2: internal watchdog fault bit set"), any);
+    /* The startup watchdog only runs while GATE1 is coming up; a rail that
+     * is regulating now has, by definition, finished startup, so a set
+     * watchdog bit is a historical record of the power-up sequence.        */
+    emitLatched(rail, F("MFR2: internal watchdog fault bit set"), any, healthy);
   }
   if (bitIsSet(smfr2, kStatusMfr2BitShortCirc)) {
-    emitLatched(rail, F("MFR2: short-circuit fault bit set"), any);
+    emitLatched(rail, F("MFR2: short-circuit fault bit set"), any, healthy);
   }
   if (bitIsSet(smfr2, kStatusMfr2BitEnergyWarn)) {
     emitLatched(rail,
-        F("MFR2: energy accumulator overflow warning bit set"), any);
+        F("MFR2: energy accumulator overflow warning bit set"), any, healthy);
   }
   if (bitIsSet(smfr2, kStatusMfr2BitVinTrans)) {
-    emitLatched(rail, F("MFR2: VIN transient excursion bit set"), any);
+    emitLatched(rail, F("MFR2: VIN transient excursion bit set"), any, healthy);
   }
 }
 
 /** DIAGNOSTIC_WORD (PMBus 0xE1, 16-bit). */
-static void decodeDiagWord(uint16_t diag, uint8_t scml,
-                           const char* rail, bool& any) {
+static void decodeDiagWord(const RailTelemetry& tlm, const char* rail,
+                           bool& any) {
+  const uint16_t diag = tlm.diag_word;
+  const uint8_t  scml = tlm.status_cml;
+  const bool healthy = railHealthyNow(tlm);
   if (bitIsSet(diag, kDiagBitTimerLatchedOff)) {
-    emitLatched(rail, F("DIAG: timer latched OFF bit set"), any);
+    emitLatched(rail, F("DIAG: timer latched OFF bit set"), any, healthy);
   }
   if (bitIsSet(diag, kDiagBitFetFail)) {
-    emitLatched(rail, F("DIAG: external MOSFET failure bit set"), any);
+    emitLatched(rail, F("DIAG: external MOSFET failure bit set"), any, healthy);
   }
   if (bitIsSet(diag, kDiagBitVinUvFault)) {
-    emitLatched(rail, F("DIAG: VIN undervoltage fault bit set"), any);
+    emitLatched(rail, F("DIAG: VIN undervoltage fault bit set"), any,
+                !vinUnderVoltageNow(tlm));
   }
   if (bitIsSet(diag, kDiagBitVinOvFault)) {
-    emitLatched(rail, F("DIAG: VIN overvoltage fault bit set"), any);
+    emitLatched(rail, F("DIAG: VIN overvoltage fault bit set"), any,
+                !vinOverVoltageNow(tlm));
   }
   if (bitIsSet(diag, kDiagBitIinOcFault)) {
     emitLatched(rail,
-        F("DIAG: IIN overcurrent / power-FET op fault bit set"), any);
+        F("DIAG: IIN overcurrent / power-FET op fault bit set"), any, healthy);
   }
   if (bitIsSet(diag, kDiagBitOverTempFault)) {
-    emitLatched(rail, F("DIAG: over-temperature fault bit set"), any);
+    emitLatched(rail, F("DIAG: over-temperature fault bit set"), any,
+                !overTempNow(tlm));
   }
   /* DIAG bit 1 mirrors STATUS_CML.  We suppress this echo in two cases
    * to avoid double-reporting:
@@ -941,10 +1023,10 @@ static void decodeDiagWord(uint16_t diag, uint8_t scml,
   const bool real_cml_bits =
       (scml & kCmlBitsExceptMemoryFault) != 0U;
   if (bitIsSet(diag, kDiagBitCmlFault) && real_cml_bits) {
-    emitLatched(rail, F("DIAG: CML communication fault bit set"), any);
+    emitLatched(rail, F("DIAG: CML communication fault bit set"), any, healthy);
   }
   if (bitIsSet(diag, kDiagBitCbFault)) {
-    emitLatched(rail, F("DIAG: circuit breaker trip bit set"), any);
+    emitLatched(rail, F("DIAG: circuit breaker trip bit set"), any, healthy);
   }
 }
 
@@ -967,12 +1049,12 @@ static void describeRailFaults(const RailTelemetry& tlm) {
 
   bool any = false;
   decodeLiveConditions(tlm, rail, any);
-  decodeStatusWord (tlm.status_word,            rail, any);
-  decodeStatusInput(tlm.status_input,           rail, any);
-  decodeStatusCml  (tlm.status_cml,             rail, any);
-  decodeStatusMfr  (tlm.status_mfr_specific,    rail, any);
-  decodeStatusMfr2 (tlm.status_mfr_specific2,   rail, any);
-  decodeDiagWord   (tlm.diag_word, tlm.status_cml, rail, any);
+  decodeStatusWord (tlm, rail, any);
+  decodeStatusInput(tlm, rail, any);
+  decodeStatusCml  (tlm, rail, any);
+  decodeStatusMfr  (tlm, rail, any);
+  decodeStatusMfr2 (tlm, rail, any);
+  decodeDiagWord   (tlm, rail, any);
 
   if (!any) {
     Serial.print(F("  " ANSI_GREEN "[OK    ]" ANSI_RESET " "));

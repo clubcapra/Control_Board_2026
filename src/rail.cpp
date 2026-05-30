@@ -38,6 +38,11 @@ constexpr uint32_t kRailReattachInterval_ms = 5000UL;
  * Do not keep power-cycling it quickly, or the STM32 can prevent TIMER from
  * ever reaching the restart threshold.                                      */
 constexpr uint32_t kOnRecoveryRetryPeriodMs = 15000UL;
+/* Delay after a turn-on before the one-shot "settle clear" wipes latched
+ * startup-transient bits (e.g. the MFR2 startup-watchdog fault).  Long
+ * enough for the chip's startup watchdog window to elapse and the rail to
+ * reach steady-state regulation, so the clear only runs on a healthy rail. */
+constexpr uint32_t kStartupSettleClearMs = 3000UL;
 constexpr uint32_t kOperationRestartWaitMs = 30000UL;
 constexpr uint32_t kPostOnObservePeriodMs = 60000UL;
 constexpr uint8_t kStartupWatchdogMax = 0xFU;
@@ -104,7 +109,9 @@ Controller::Controller(const RailConfig& cfg)
       post_on_observe_ms_(0U),
       pending_on_recovery_(false),
       post_on_observe_(false),
-      desired_on_(false) {}
+      desired_on_(false),
+      startup_settle_clear_done_(false),
+      enable_ms_(0U) {}
 
 Controller::Controller(const RailConfig& cfg, LM5066H1Bus& bus)
     : cfg_(cfg),
@@ -149,7 +156,9 @@ Controller::Controller(const RailConfig& cfg, LM5066H1Bus& bus)
       post_on_observe_ms_(0U),
       pending_on_recovery_(false),
       post_on_observe_(false),
-      desired_on_(false) {}
+      desired_on_(false),
+      startup_settle_clear_done_(false),
+      enable_ms_(0U) {}
 
 Status Controller::init() {
   /* The selected bus is initialised by main(); just attach to it.           */
@@ -176,6 +185,30 @@ Status Controller::init() {
   }
   present_ = true;
 
+  /* [REQ-PWR-060] Enable SMBus PEC for telemetry integrity, then prove it
+   * actually works on this device/bus before relying on it.  PEC appends a
+   * CRC-8 to every word/byte read so a corrupted PMBus transaction is
+   * rejected instead of surfacing as a garbage V/I/P/temp reading.  If the
+   * self-check cannot land a single valid PEC read (incapable bus, wrong
+   * pull-ups, ...), fall back to unprotected reads so the rail still streams
+   * telemetry rather than freezing every register.                        */
+  device_.setPecEnabled(true);
+  bool pec_ok = false;
+  for (uint8_t attempt = 0U; attempt < 4U; ++attempt) {
+    uint16_t probe = 0U;
+    if (device_.readStatusWord(probe)) {
+      pec_ok = true;
+      break;
+    }
+    delay(2);
+  }
+  device_.setPecEnabled(pec_ok);
+  Serial.print(F("[CFG "));
+  Serial.print(railToString(cfg_.id));
+  Serial.println(pec_ok
+      ? F("] PEC enabled on PMBus reads (CRC-checked telemetry)")
+      : F("] PEC self-check failed - falling back to unprotected reads"));
+
   const Status s = configureDevice();
   if (s != Status::kOk) {
     state_ = State::kTripped;
@@ -188,6 +221,29 @@ Status Controller::init() {
    * once the NVM checksum is valid the chip stops asserting memoryFault
    * and this call becomes a no-op on every subsequent boot.              */
   (void)repairNvmIfNeeded();
+
+  /* [REQ-PWR-041] Re-assert the startup watchdog window AFTER the NVM repair.
+   * repairNvmIfNeeded() may issue STORE_USER_ALL, whose EE-program cycle
+   * reloads the manufacturer-specific WD_PLB_TIMER from its 0xBF EEPROM
+   * default (950 ms watchdog) - far shorter than the anticipated output
+   * cap charge time, so the startup watchdog trips and latches a spurious
+   * MFR2 watchdog fault on the next GATE enable.  Force the live value back
+   * to the 9.5 s maximum so it always wins over the EEPROM default, then
+   * clear the latch the short window may already have set.                 */
+  {
+    LM5066H1::WdPlbTimerBits wd = {};
+    (void)device_.readWdPlbTimer(wd);
+    if (wd.watchdogTimer != kStartupWatchdogMax) {
+      wd.watchdogTimer = kStartupWatchdogMax;
+      if (device_.setWdPlbTimer(wd)) {
+        (void)device_.clearFaults();
+        Serial.print(F("[CFG "));
+        Serial.print(railToString(cfg_.id));
+        Serial.println(F("] WD_PLB reverted to EEPROM default after NVM "
+            "store - re-asserted 9.5s startup watchdog"));
+      }
+    }
+  }
 
   state_        = State::kReady;
   last_tick_ms_ = millis();
@@ -328,7 +384,20 @@ Status Controller::configureDevice() {
   bb.bbTick = 0U;  /* 10 us tick, highest timing resolution */
   device_.setBbConfig(bb);
 
-  /* Gate-mask: allow all hardware-level faults to pull the GATE off.        */
+  /* Gate-mask: let the real protection faults (SCP, FET-fail, VIN UV/OV,
+   * IIN/PFET, over-temp, circuit-breaker) pull the GATE off, but KEEP the
+   * startup watchdog MASKED (its datasheet default, GATE_MASK bit1 = 1).
+   *
+   * [REQ-PWR-061] Rationale: the watchdog only checks that PGD asserts within
+   * its window after GATE1 turns on.  With a large TIMER-pin cap (the board
+   * uses 10 uF -> ~7.8 s insertion delay and a slow inrush), a healthy
+   * start-up legitimately takes longer than the 9.5 s watchdog maximum.  If
+   * the watchdog is allowed to control the gate it tears the FET down mid
+   * start-up and the rail can never ride through its own retry sequence -
+   * i.e. it never recovers by itself after a fault.  Masking the watchdog
+   * (gate has no watchdog control) still records the bit in
+   * STATUS_MFR_SPECIFIC_2 for telemetry, but lets the chip's retry=7 logic
+   * and the genuine analog protections govern start-up and auto-recovery.  */
   LM5066H1::GateMaskBits gate = {};
   gate.scpFault              = false;
   gate.fetFail               = false;
@@ -336,7 +405,7 @@ Status Controller::configureDevice() {
   gate.vinOvFault            = false;
   gate.iinPfetFault          = false;
   gate.overtempFault         = false;
-  gate.watchdogFault         = false;
+  gate.watchdogFault         = true;   /* masked: watchdog must NOT pull GATE */
   gate.circuitBreakerFault   = false;
   device_.setGateMask(gate);
 
@@ -484,12 +553,36 @@ Status Controller::reattachIfDue() {
   }
   last_reattach_ms_ = now;
 
+  /* [REQ-PWR-051] Unstick the bus controller first.  When an LM5066H1 is
+   * hot-removed (or browns out) mid-transaction it can leave the STM32
+   * hardware I2C peripheral wedged in a BUSY state; from then on every ACK
+   * probe fails and the rail can never be re-detected even after the device
+   * returns.  Re-initialising the controller clears that wedge.  A device
+   * that lost power releases SDA/SCL on its own, so a peripheral re-init is
+   * sufficient to free the bus for re-detection.                          */
+  device_.recoverBus();
+
   /* Probe the PMBus.  beginAttached() does an address ACK check; if the
    * device does not respond we leave state alone and the next tick will
    * try again after the interval.                                       */
   if (!device_.beginAttached(cfg_.smbus_clock_hz)) {
     return Status::kNotPresent;
   }
+
+  /* Re-verify PEC on the returning device (state was reset on the way out).
+   * Mirrors the boot-time self-check so a reattached rail comes back with
+   * CRC-protected telemetry, or cleanly falls back if PEC cannot land.    */
+  device_.setPecEnabled(true);
+  bool pec_ok = false;
+  for (uint8_t attempt = 0U; attempt < 4U; ++attempt) {
+    uint16_t probe = 0U;
+    if (device_.readStatusWord(probe)) {
+      pec_ok = true;
+      break;
+    }
+    delay(2);
+  }
+  device_.setPecEnabled(pec_ok);
 
   Serial.print(F("[RAIL "));
   Serial.print(railToString(cfg_.id));
@@ -558,7 +651,44 @@ Status Controller::enable() {
   state_         = State::kRunning;
   accum_3min_ms_ = 0U;
   accum_1min_ms_ = 0U;
+  /* Arm the one-shot post-startup settle clear for this turn-on. */
+  startup_settle_clear_done_ = false;
+  enable_ms_ = millis();
   return Status::kOk;
+}
+
+Status Controller::resetAndEnable() {
+  /* A rail whose LM5066H1 never ACKed has nothing to reset; the periodic
+   * reattach probe in tick() will bring it online later if it appears.     */
+  if (!present_ || state_ == State::kAbsent) {
+    return Status::kNotPresent;
+  }
+
+  /* Clean-slate the chip's latch state machine before energising:
+   *   - reset the firmware-side trip accounting,
+   *   - force a kTripped / kLatched rail back to kReady so enable() is not
+   *     refused,
+   *   - issue CLEAR_FAULTS twice.  The first pass drops every latch whose
+   *     underlying condition has already cleared; the second mops up bits
+   *     that the chip re-evaluates one cycle later (notably the VIN UV/OV
+   *     latches recorded while VIN ramped up through the 0 -> nominal band).
+   * enable() then issues a third CLEAR_FAULTS immediately before the
+   * OPERATION = ON write, so the rail comes up with a clean STATUS set.     */
+  fault_count_   = 0U;
+  accum_3min_ms_ = 0U;
+  accum_1min_ms_ = 0U;
+  if (state_ == State::kTripped || state_ == State::kLatched) {
+    state_ = State::kReady;
+  }
+
+  (void)device_.clearFaults();
+  delay(2);
+  (void)device_.clearFaults();
+
+  Serial.print(F("[BOOT "));
+  Serial.print(railToString(cfg_.id));
+  Serial.println(F("] reset: faults cleared, commanding OUTPUT ON"));
+  return enable();
 }
 
 Status Controller::disable() {
@@ -570,6 +700,7 @@ Status Controller::disable() {
   }
   pending_on_recovery_ = false;
   post_on_observe_ = false;
+  startup_settle_clear_done_ = true;  /* nothing to settle while OFF */
   if (state_ == State::kRunning || state_ == State::kWarning) {
     state_ = State::kReady;
   }
@@ -852,6 +983,25 @@ void Controller::tick() {
     const bool chip_reports_off =
         (status_word & (1U << 6)) != 0U ||
         (diag_word   & (1U << 6)) != 0U;
+
+    /* One-shot post-startup settle clear: once the rail is commanded ON and
+     * the chip confirms it is regulating (not reporting device-off), wipe any
+     * latch the chip set during its own startup retry sequence - those
+     * happen after the boot-time clears, so a single deferred CLEAR_FAULTS is
+     * the only way to retire them.  Gated on a healthy rail, so a genuine
+     * startup failure (FET still off) is never masked; if a real fault
+     * recurs after this, the decoder surfaces it again on the next tick.   */
+    if (desired_on_ && cmd_on && !chip_reports_off &&
+        !startup_settle_clear_done_ &&
+        (now - enable_ms_) >= kStartupSettleClearMs) {
+      (void)device_.clearFaults();
+      startup_settle_clear_done_ = true;
+      Serial.print(F("[HOTSWAP "));
+      Serial.print(railToString(cfg_.id));
+      Serial.println(F("] healthy after startup - cleared transient "
+          "startup latches"));
+    }
+
     if (pending_on_recovery_) {
       if ((now - pending_on_recovery_ms_) >= kOperationRestartWaitMs) {
         Serial.print(F("[HOTSWAP "));

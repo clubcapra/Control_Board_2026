@@ -105,7 +105,8 @@ LM5066H1::LM5066H1(uint8_t address, TwoWire& wire)
       _ntcNominalOhms(10000.0),
       _ntcNominalTempC(25.0),
       _ntcBeta(3950.0),
-      _ntcSupplyVolts(3.3) {}
+      _ntcSupplyVolts(3.3),
+      _pecEnabled(false) {}
 
 LM5066H1::LM5066H1(uint8_t address, LM5066H1Bus& bus)
     : _address(address),
@@ -119,7 +120,8 @@ LM5066H1::LM5066H1(uint8_t address, LM5066H1Bus& bus)
       _ntcNominalOhms(10000.0),
       _ntcNominalTempC(25.0),
       _ntcBeta(3950.0),
-      _ntcSupplyVolts(3.3) {}
+      _ntcSupplyVolts(3.3),
+      _pecEnabled(false) {}
 
 bool LM5066H1::begin(int sdaPin, int sclPin, uint32_t clockHz) {
 #if defined(ARDUINO_ARCH_STM32) || defined(STM32F1xx) || defined(STM32F1)
@@ -150,6 +152,8 @@ bool LM5066H1::isPresent() {
   _bus->beginTransmission(_address);
   return _bus->endTransmission() == 0;
 }
+
+void LM5066H1::recoverBus() { _bus->recover(); }
 
 void LM5066H1::setAddress(uint8_t address) {
   _address = address;
@@ -265,16 +269,46 @@ bool LM5066H1::writeBlockCommand(uint8_t cmd, const uint8_t* data,
   return _bus->endTransmission() == 0;
 }
 
+uint8_t LM5066H1::pecCrc8(uint8_t crc, uint8_t data) {
+  crc ^= data;
+  for (uint8_t i = 0U; i < 8U; ++i) {
+    if ((crc & 0x80U) != 0U) {
+      crc = static_cast<uint8_t>((crc << 1) ^ 0x07U);
+    } else {
+      crc = static_cast<uint8_t>(crc << 1);
+    }
+  }
+  return crc;
+}
+
+void LM5066H1::setPecEnabled(bool enable) { _pecEnabled = enable; }
+bool LM5066H1::pecEnabled() const { return _pecEnabled; }
+
 bool LM5066H1::readByte(uint8_t reg, uint8_t& value) {
   _bus->beginTransmission(_address);
   _bus->write(reg);
   if (_bus->endTransmission(false) != 0) {
     return false;
   }
-  if (_bus->requestFrom(_address, static_cast<uint8_t>(1)) != 1) {
+  const uint8_t want = _pecEnabled ? 2U : 1U;
+  if (_bus->requestFrom(_address, want) != want) {
     return false;
   }
-  value = _bus->read();
+  const uint8_t data = static_cast<uint8_t>(_bus->read());
+  if (_pecEnabled) {
+    const uint8_t pec = static_cast<uint8_t>(_bus->read());
+    /* PEC spans the whole Read-Byte transaction in wire order:
+     * [addr|W], command, [addr|R], data. */
+    uint8_t crc = 0U;
+    crc = pecCrc8(crc, static_cast<uint8_t>(_address << 1));
+    crc = pecCrc8(crc, reg);
+    crc = pecCrc8(crc, static_cast<uint8_t>((_address << 1) | 1U));
+    crc = pecCrc8(crc, data);
+    if (crc != pec) {
+      return false;
+    }
+  }
+  value = data;
   return true;
 }
 
@@ -284,11 +318,26 @@ bool LM5066H1::readWord(uint8_t reg, uint16_t& value) {
   if (_bus->endTransmission(false) != 0) {
     return false;
   }
-  if (_bus->requestFrom(_address, static_cast<uint8_t>(2)) != 2) {
+  const uint8_t want = _pecEnabled ? 3U : 2U;
+  if (_bus->requestFrom(_address, want) != want) {
     return false;
   }
-  uint8_t low = _bus->read();
-  uint8_t high = _bus->read();
+  const uint8_t low  = static_cast<uint8_t>(_bus->read());
+  const uint8_t high = static_cast<uint8_t>(_bus->read());
+  if (_pecEnabled) {
+    const uint8_t pec = static_cast<uint8_t>(_bus->read());
+    /* PEC spans the whole Read-Word transaction in wire order:
+     * [addr|W], command, [addr|R], data_low, data_high. */
+    uint8_t crc = 0U;
+    crc = pecCrc8(crc, static_cast<uint8_t>(_address << 1));
+    crc = pecCrc8(crc, reg);
+    crc = pecCrc8(crc, static_cast<uint8_t>((_address << 1) | 1U));
+    crc = pecCrc8(crc, low);
+    crc = pecCrc8(crc, high);
+    if (crc != pec) {
+      return false;
+    }
+  }
   value = static_cast<uint16_t>(high << 8) | low;
   return true;
 }

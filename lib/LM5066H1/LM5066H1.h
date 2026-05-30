@@ -15,6 +15,12 @@ class LM5066H1Bus {
   virtual size_t requestFrom(uint8_t address, uint8_t quantity) = 0;
   virtual int available() = 0;
   virtual int read() = 0;
+
+  /** Recover a wedged bus controller (e.g. a hardware I2C peripheral left
+   *  stuck BUSY when a slave vanished mid-transaction).  Default is a no-op;
+   *  hardware-peripheral buses override this to re-initialise the controller
+   *  so a hot-removed device can be re-detected when it returns. */
+  virtual void recover() {}
 };
 
 class LM5066H1TwoWireBus final : public LM5066H1Bus {
@@ -35,6 +41,16 @@ class LM5066H1TwoWireBus final : public LM5066H1Bus {
   }
   int available() override { return _wire.available(); }
   int read() override { return _wire.read(); }
+
+  /** Re-initialise the hardware I2C peripheral.  TwoWire::end() de-inits the
+   *  controller (clearing a stuck BUSY state) and begin() brings it back up
+   *  on the previously-assigned SDA/SCL pins.  A device that lost power
+   *  releases the bus lines on its own, so this is sufficient to free the
+   *  bus for re-detection when the device returns. */
+  void recover() override {
+    _wire.end();
+    _wire.begin();
+  }
 
 #if defined(ARDUINO_ARCH_STM32) || defined(STM32F1xx) || defined(STM32F1)
   void setSDA(uint32_t pin) { _wire.setSDA(pin); }
@@ -349,6 +365,11 @@ class LM5066H1 {
 
   bool isPresent();
 
+  /** Recover a wedged bus controller (forwards to the underlying bus).
+   *  Used by the rail reattach path so a hardware I2C peripheral left stuck
+   *  BUSY by a hot-removed device can be unstuck before re-probing. */
+  void recoverBus();
+
   void setAddress(uint8_t address);
   uint8_t address() const;
 
@@ -363,6 +384,14 @@ class LM5066H1 {
 
   void setAdcFullScale2x(bool enable);
   bool adcFullScale2x() const;
+
+  /** SMBus Packet Error Checking (PEC).  When enabled, readByte()/readWord()
+   *  clock an extra CRC-8 byte from the device and reject the transaction
+   *  (return false) if the CRC does not match, catching corrupted PMBus
+   *  words before they reach the telemetry layer.  Disabled devices read
+   *  without the trailing PEC byte (legacy behaviour). */
+  void setPecEnabled(bool enable);
+  bool pecEnabled() const;
 
   void setNtcConfig(const NtcConfig& config);
   NtcConfig ntcConfig() const;
@@ -688,6 +717,11 @@ class LM5066H1 {
 
   bool sendByte(uint8_t cmd);
 
+  /** SMBus PEC CRC-8 (polynomial x^8+x^2+x+1 = 0x07, seed 0x00).  Folds one
+   *  byte into the running CRC; callers feed every byte of the transaction
+   *  (address+command bytes included) in wire order. */
+  static uint8_t pecCrc8(uint8_t crc, uint8_t data);
+
   uint8_t _address;
   LM5066H1TwoWireBus _wireBus;
   LM5066H1Bus* _bus;
@@ -700,6 +734,7 @@ class LM5066H1 {
   double _ntcNominalTempC;
   double _ntcBeta;
   double _ntcSupplyVolts;
+  bool _pecEnabled;
 
   static constexpr uint8_t kCmdOperation = 0x01;
   static constexpr uint8_t kCmdClearFaults = 0x03;

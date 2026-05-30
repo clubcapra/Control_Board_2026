@@ -105,6 +105,13 @@ class Controller {
   /** Command OUTPUT ON.  Refuses if state is kAbsent / kLatched.            */
   Status enable();
 
+  /** Boot-time clean slate: wipe every latched fault on the LM5066H1 and
+   *  command OUTPUT ON.  Force-releases a kTripped / kLatched rail back to
+   *  kReady first so the rail always comes up energised with no stale
+   *  UV/OV latches inherited from the power-up VIN ramp.  No-op (returns
+   *  kNotPresent) for a rail whose device never ACKed.                     */
+  Status resetAndEnable();
+
   /** Command OUTPUT OFF.  Always accepted - safe failure path.              */
   Status disable();
 
@@ -235,6 +242,15 @@ class Controller {
   bool     pending_on_recovery_;
   bool     post_on_observe_;
   bool     desired_on_;
+
+  /* One-shot "settle clear": a short time after a successful, healthy
+   * turn-on we issue a single CLEAR_FAULTS to wipe latched bits the chip
+   * set during its own startup retry (e.g. the MFR2 startup-watchdog
+   * fault) AFTER the boot-time clears already ran.  Armed (set false) on
+   * every enable()/disable(); performed once per turn-on, and only while
+   * the rail is actually regulating, so it can never hide a real fault. */
+  bool     startup_settle_clear_done_;
+  uint32_t enable_ms_;
 };
 
 }  /* namespace rail */

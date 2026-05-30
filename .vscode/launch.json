@@ -41,6 +41,25 @@
             }
         },
         {
+            "name": "C/C++ Runner: Debug Session",
+            "type": "cppdbg",
+            "request": "launch",
+            "args": [],
+            "stopAtEntry": false,
+            "externalConsole": true,
+            "cwd": "c:/Users/afifa/Documents/ele791/code_lm5066h1/src",
+            "program": "c:/Users/afifa/Documents/ele791/code_lm5066h1/src/build/Debug/outDebug",
+            "MIMode": "gdb",
+            "miDebuggerPath": "C:/Users/afifa/.platformio/packages/toolchain-gdbarmnoneeabi/bin/arm-none-eabi-gcc.exe",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
             "type": "platformio-debug",
             "request": "launch",
             "name": "PIO Debug",
