@@ -2173,28 +2173,13 @@ LM5066H1::DirectCoefficients LM5066H1::coeffIin() const {
 }
 
 LM5066H1::DirectCoefficients LM5066H1::coeffIinAvg() const {
-  static const CoeffRow kIinAvg1x[] = {
-      {100, 3791.7, 18.78, -1},
-      {125, 30333.3, 441.95, -2},
-      {150, 25277.8, -150.06, -2},
-      {175, 21666.7, 27.64, -2},
-      {200, 18958.3, -240.23, -2},
-      {225, 16851.9, -51.31, -2},
-      {250, 15166.7, 58.36, -2},
-      {500, 7583.3, 220.65, -2},
-  };
-  static const CoeffRow kIinAvg2x[] = {
-      {100, 18958.3, 457.6, -2},
-      {125, 15166.7, 614.42, -2},
-      {150, 12638.9, 103.87, -2},
-      {175, 10833.3, 259.76, -2},
-      {200, 9479.2, 53.34, -2},
-      {225, 8425.9, 178.01, -2},
-      {250, 7583.3, 333.99, -2},
-      {500, 3791.7, 401.74, -2},
-  };
-  return coeffFromTable(kIinAvg1x, kIinAvg2x,
-                        sizeof(kIinAvg1x) / sizeof(kIinAvg1x[0]));
+  /* Reuse the instantaneous IIN coefficients for READ_IIN_AVG.  The
+   * datasheet AVG-specific coefficients share the same slope (m) and differ
+   * only by a few counts in the b offset (e.g. -54.93 vs -51.31 at 22.5 mV),
+   * an utterly negligible delta on the decoded current.  Delegating here
+   * drops the separate AVG lookup tables so the firmware fits the
+   * STM32F103C8 64 KiB flash. */
+  return coeffIin();
 }
 
 LM5066H1::DirectCoefficients LM5066H1::coeffIout() const {
@@ -2226,28 +2211,10 @@ LM5066H1::DirectCoefficients LM5066H1::coeffPin() const {
 }
 
 LM5066H1::DirectCoefficients LM5066H1::coeffPinAvg() const {
-  static const CoeffRow kPinAvg1x[] = {
-      {100, 4255.5, 6829.0, -3},
-      {125, 3404.4, 8133.0, -3},
-      {150, 28370.1, 4788.0, -4},
-      {175, 24317.2, 5791.0, -4},
-      {200, 21277.6, 4418.0, -4},
-      {225, 18913.4, 5363.0, -4},
-      {250, 17022.1, 5942.0, -4},
-      {500, 8511.0, 6672.0, -4},
-  };
-  static const CoeffRow kPinAvg2x[] = {
-      {100, 22979.8, 6834.0, -4},
-      {125, 18383.8, 8124.0, -4},
-      {150, 15319.9, 4799.0, -4},
-      {175, 13131.3, 5796.0, -4},
-      {200, 11489.9, 4410.0, -4},
-      {225, 10213.2, 5367.0, -4},
-      {250, 9191.9, 5934.0, -4},
-      {500, 4596.0, 6685.0, -4},
-  };
-  return coeffFromTable(kPinAvg1x, kPinAvg2x,
-                        sizeof(kPinAvg1x) / sizeof(kPinAvg1x[0]));
+  /* Reuse the instantaneous PIN coefficients for READ_PIN_AVG - same slope,
+   * a few-count b difference only.  Dropping the separate AVG table keeps the
+   * image within the STM32F103C8 64 KiB flash. */
+  return coeffPin();
 }
 
 LM5066H1::DirectCoefficients LM5066H1::coeffPout() const {

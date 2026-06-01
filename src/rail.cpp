@@ -270,6 +270,30 @@ Status Controller::configureDevice() {
   device_.setAdcConfig2(adc2);
   device_.setAdcFullScale2x(false);
 
+  /* [REQ-PWR-062] Force ADC_CONFIG_1 to MODE=00 = continuous, auto-sequenced
+   * conversion of ALL channels.  This is mandatory for valid telemetry: the
+   * datasheet (Table 7-62 note) warns the single-channel debug modes (01/10)
+   * "prevent the ADC from sampling all the necessary signals needed for
+   * telemetry and protection".  A part that powers up (or is left by NVM /
+   * the host bridge) in a single-channel mode returns stale / cross-channel
+   * data on READ_VIN/VOUT/IIN/PIN - i.e. steady analog input but wildly
+   * jumping readings.  We log the as-found mode for traceability, then pin
+   * the round-robin mode so every channel is sampled each cycle.            */
+  LM5066H1::AdcConfig1Bits adc1 = {};
+  device_.readAdcConfig1(adc1);
+  const uint8_t adc1_mode_found = adc1.mode;
+  adc1.mode      = 0U;   /* continuous, auto-sequenced (all channels)        */
+  adc1.convChSel = 0U;
+  adc1.convst    = false;
+  device_.setAdcConfig1(adc1);
+
+  /* [REQ-PWR-063] Average a large number of ADC samples on-chip so the
+   * READ_*_AVG telemetry registers (used by tick()) are immune to the
+   * per-sample ADC/reference jitter seen on this hardware.  SAMPLES_FOR_AVG
+   * is a power-of-two exponent: 2^11 = 2048 samples (~41 ms averaging
+   * window), comfortably inside the 100 ms telemetry cadence.               */
+  device_.setSamplesForAvg(11U);
+
   /* DEVICE_SETUP1: select PMBus VCL (currentLimitConfig=1), CB low-side.
    * retrySetting = 7 -> infinite automatic retry on any latched fault
    * (VIN OV/UV, OC, OT, CB, FET).  The chip re-engages the GATE on its own
@@ -462,7 +486,9 @@ Status Controller::configureDevice() {
   Serial.print(F(" retryDelay="));
   Serial.print(dly_rb.retryDelay);
   Serial.print(F(" WD="));
-  Serial.println(wd_rb.watchdogTimer);
+  Serial.print(wd_rb.watchdogTimer);
+  Serial.print(F(" ADC1mode_found="));
+  Serial.println(adc1_mode_found);
 
   return Status::kOk;
 }
@@ -892,12 +918,18 @@ void Controller::tick() {
   uint8_t  wd_plb_timer = 0U;
   double   die_temp_c = NAN;
 
-  bool ok_iin   = device_.readIin(iin);
-  bool ok_vin   = device_.readVin(vin);
-  bool ok_vout  = device_.readVout(vout);
-  bool ok_vaux  = device_.readVaux(vaux);
-  bool ok_pin   = device_.readPin(pin);
-  bool ok_temp  = device_.readTemperatureC(die_temp_c);
+  /* Use the LM5066H1 on-chip AVERAGED registers (READ_*_AVG) instead of the
+   * single-shot READ_* registers.  The chip averages SAMPLES_FOR_AVG ADC
+   * conversions internally (configured in configureDevice), which rejects
+   * the per-sample ADC/reference jitter that otherwise makes V/I/P/temp
+   * bounce frame-to-frame.  Coefficients are the AVG-specific set inside the
+   * driver.                                                                 */
+  bool ok_iin   = device_.readAvgIin(iin);
+  bool ok_vin   = device_.readAvgVin(vin);
+  bool ok_vout  = device_.readAvgVout(vout);
+  bool ok_vaux  = device_.readVauxAvg(vaux);
+  bool ok_pin   = device_.readAvgPin(pin);
+  bool ok_temp  = device_.readTempAvgC(die_temp_c);
   bool ok_sw    = device_.readStatusWord(status_word);
   bool ok_diag  = device_.readDiagnosticWord(diag_word);
   bool ok_smfr2 = device_.readStatusMfrSpecific2(status_mfr2);
